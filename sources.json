@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {"id":"poc-in-github","type":"git","parser":"github-poc","url":"https://github.com/nomi-sec/PoC-in-GitHub.git","budget":10000,"provenance":"nomi-sec community PoC index"},
+    {"id":"exploit-db","type":"git","parser":"exploitdb","url":"https://gitlab.com/exploit-database/exploitdb.git","include":["files_exploits.csv"],"sparse":["/files_exploits.csv"],"budget":1,"provenance":"official Exploit-DB GitLab repository"},
+    {"id":"vulncheck","type":"vulncheck","url":"https://api.vulncheck.com/v3/index/exploits","secret":"VULNCHECK_API_KEY","lookback_days":30,"budget":1000,"provenance":"VulnCheck authenticated API"},
+    {"id":"vulners","type":"vulners-poc","url":"https://vulners.com","secret":"VULNERS_API_KEY","lookback_days":30,"budget":200,"provenance":"Vulners authenticated API"}
+  ]
+}
