@@ -6,7 +6,9 @@ import json
 from pathlib import Path
 import unittest
 
-from sync.continuations import assemble_records, join_record, split_record
+from sync import continuations
+from sync.continuations import (assemble_records, join_record, split_record, AFFECTED_FORMAT,
+                                MAX_LOGICAL_BYTES, MAX_AFFECTED_BYTES, MAX_AFFECTED_PARTS)
 
 
 def encoded(value):
@@ -26,7 +28,119 @@ def record(size=40000):
         'provenance': [{'source_id': 'cve', 'role': 'cna', 'provider': 'synthetic'}]}
 
 
+def affected_record(count=2712):
+    result = record(1)
+    result['affected'] = [{'product': f'发行版-{index}', 'provider': {'orgId': 'fixture-adp'},
+        'assertion_role': 'adp', 'original_ranges': [{'version': f'{index}.0', 'lessThan': f'{index}.5',
+            'status': 'affected', 'original_expression': '原始范围 αβ; ' * 8}]} for index in range(count)]
+    result['assertions'] = [{'role': 'adp', 'provider': {'orgId': 'fixture-adp'}, 'affected_indices': list(range(count))}]
+    return result
+
+
+def forged_affected_bundle(logical):
+    """Make hash-consistent hostile bytes to exercise consumer semantic validation."""
+    data = encoded(logical)
+    parent = continuations._stub(logical)
+    count = (len(data) + 8191) // 8192
+    parts = [continuations._part(parent, data[index * 8192:(index + 1) * 8192], index, count)
+             for index in range(count)]
+    parent['continuation'] = {'format': AFFECTED_FORMAT, 'parts': [part['record_id'] for part in parts],
+        'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest(), 'requires_reassembly': True,
+        'affected_count': len(logical['affected'])}
+    return [parent, *parts]
+
+
 class ContinuationTests(unittest.TestCase):
+    def test_affected_v2_preserves_every_entry_assertion_index_and_identity(self):
+        original = affected_record()
+        self.assertGreater(len(encoded(original)), MAX_LOGICAL_BYTES)
+        rows = split_record(original)
+        descriptor = rows[0]['continuation']
+        self.assertEqual(descriptor['format'], AFFECTED_FORMAT)
+        self.assertEqual(descriptor['affected_count'], 2712)
+        self.assertLessEqual(len(rows) - 1, MAX_AFFECTED_PARTS)
+        self.assertTrue(all(len(encoded(row)) <= 16384 for row in rows))
+        self.assertEqual(assemble_records(rows), [original])
+        self.assertEqual(assemble_records({row['record_id']: row for row in rows}), [original])
+        self.assertEqual(split_record(copy.deepcopy(original)), rows)
+        self.assertEqual(rows[0]['content_hash'], original['content_hash'])
+
+    def test_affected_v2_does_not_raise_v1_or_non_array_field_limits(self):
+        self.assertEqual(MAX_LOGICAL_BYTES, 262144)
+        self.assertEqual(continuations.MAX_PARTS, 64)
+        for kind in ('resource', 'poc'):
+            with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, 'logical record exceeds'):
+                split_record({**affected_record(), 'kind': kind})
+        for mode in ('huge-base', 'huge-entry', 'non-object-entry', 'total'):
+            with self.subTest(mode=mode):
+                original = record(1)
+                if mode == 'huge-base':
+                    original['title'] = 'x' * (MAX_LOGICAL_BYTES + 1)
+                elif mode == 'huge-entry':
+                    original['affected'] = [{'original_ranges': 'x' * (MAX_LOGICAL_BYTES + 1)}]
+                elif mode == 'non-object-entry':
+                    original['affected'] = ['x' * 1024] * 300
+                else:
+                    original = affected_record(8000)
+                    self.assertGreater(len(encoded(original)), MAX_AFFECTED_BYTES)
+                with self.assertRaisesRegex(ValueError, 'logical record exceeds'):
+                    split_record(original)
+
+    def test_affected_v2_consumer_rechecks_semantics_after_valid_hash_reassembly(self):
+        bad_base = record(1)
+        bad_base['title'] = 'x' * (MAX_LOGICAL_BYTES + 1)
+        bad_item = record(1)
+        bad_item['affected'] = [{'original_ranges': 'x' * (MAX_LOGICAL_BYTES + 1)}]
+        bad_kind = {**affected_record(), 'kind': 'poc'}
+        bad_items = {**record(1), 'affected': ['x' * 1024] * 300}
+        for original in (bad_base, bad_item, bad_kind, bad_items):
+            with self.subTest(kind=original['kind'], bytes=len(encoded(original))):
+                with self.assertRaisesRegex(ValueError, 'logical record exceeds'):
+                    assemble_records(forged_affected_bundle(original))
+
+    def test_affected_v2_count_missing_order_or_foreign_parts_fail_atomically(self):
+        original = affected_record()
+        rows = split_record(original)
+        for mode in ('count', 'bool-count', 'missing', 'order', 'foreign', 'orphan', 'format'):
+            with self.subTest(mode=mode):
+                changed = copy.deepcopy(rows)
+                if mode == 'count':
+                    changed[0]['continuation']['affected_count'] += 1
+                elif mode == 'bool-count':
+                    changed[0]['continuation']['affected_count'] = True
+                elif mode == 'missing':
+                    changed.pop()
+                elif mode == 'order':
+                    changed[0]['continuation']['parts'].reverse()
+                elif mode == 'foreign':
+                    changed[1]['parent_record_id'] = 'cve/foreign'
+                elif mode == 'orphan':
+                    extra = copy.deepcopy(changed[-1]); extra['record_id'] = 'cve/orphan'
+                    changed.append(extra)
+                else:
+                    changed[0]['continuation']['format'] = continuations.FORMAT
+                    del changed[0]['continuation']['affected_count']
+                with self.assertRaises(ValueError):
+                    assemble_records(changed)
+
+    def test_affected_v2_declared_total_and_part_bounds_cannot_be_bypassed(self):
+        for mode in ('bytes', 'parts', 'extra-key'):
+            with self.subTest(mode=mode):
+                rows = split_record(affected_record())
+                descriptor = rows[0]['continuation']
+                if mode == 'bytes':
+                    descriptor['bytes'] = MAX_AFFECTED_BYTES + 1
+                elif mode == 'parts':
+                    descriptor['parts'] = [f'{rows[0]["record_id"]}/part/{index:03d}' for index in range(MAX_AFFECTED_PARTS + 1)]
+                else:
+                    descriptor['unverified_bypass'] = True
+                with self.assertRaises(ValueError):
+                    assemble_records(rows)
+
+    def test_affected_v2_cannot_relabel_a_small_v1_payload(self):
+        with self.assertRaisesRegex(ValueError, 'format does not match'):
+            assemble_records(forged_affected_bundle(record(1)))
+
     def test_small_record_stays_a_single_independent_copy(self):
         original = record(1)
         rows = split_record(original)

@@ -482,11 +482,12 @@ class Run:
         # Prove the finalized record can fit a lossless bounded physical bundle
         # before advancing its source unit. Core repeats this after final events.
         logical_limit = self.policy.get('max_logical_record_bytes', 262144)
-        if len(canonical(row)) + 512 > logical_limit:
-            raise ValueError(f'oversize_record:{row["record_id"]}')
         trial = {**row, 'content_hash': '0' * 64, 'first_seen_at': row.get('first_seen_at') or self.now}
-        split_record(trial, max_record_bytes=self.policy.get('max_record_bytes', 16384),
-                     max_logical_bytes=logical_limit)
+        try:
+            split_record(trial, max_record_bytes=self.policy.get('max_record_bytes', 16384),
+                         max_logical_bytes=logical_limit)
+        except ValueError as error:
+            raise ValueError(f'oversize_record:{row["record_id"]}; {error}') from None
 
     def unit(self):
         self.units += 1

@@ -15,9 +15,12 @@ from collections.abc import Iterable, Mapping
 
 
 FORMAT = 'json-utf8-v1'
+AFFECTED_FORMAT = 'json-affected-v2'
 MAX_RECORD_BYTES = 16 * 1024
 MAX_LOGICAL_BYTES = 256 * 1024
 MAX_PARTS = 64
+MAX_AFFECTED_BYTES = 2 * 1024 * 1024
+MAX_AFFECTED_PARTS = 256
 
 
 def _canonical(value):
@@ -44,6 +47,19 @@ def _stub(record):
     return result
 
 
+def _format(record, size, max_logical_bytes):
+    """Only an array of individually bounded advisory assertions may use v2."""
+    if size <= max_logical_bytes:
+        return FORMAT
+    affected = record.get('affected')
+    if (size > MAX_AFFECTED_BYTES or record.get('kind') != 'advisory'
+            or not isinstance(affected, list) or not affected
+            or any(not isinstance(item, dict) or len(_canonical(item)) > max_logical_bytes for item in affected)
+            or len(_canonical({**record, 'affected': []})) > max_logical_bytes):
+        raise ValueError('logical record exceeds continuation byte ceiling outside bounded affected-array format')
+    return AFFECTED_FORMAT
+
+
 def _part(parent, payload, index, count):
     chunk_hash = _digest(payload)
     identifier = f'{parent["record_id"]}/part/{index:03d}'
@@ -68,22 +84,24 @@ def split_record(record: dict, *, max_record_bytes=MAX_RECORD_BYTES,
     if record.get('kind') == 'continuation' or 'continuation' in record:
         raise ValueError('nested continuation is not allowed')
     data = _canonical(record)
-    if len(data) > max_logical_bytes:
-        raise ValueError('logical record exceeds continuation byte ceiling')
+    format_name = _format(record, len(data), max_logical_bytes)
     if len(data) <= max_record_bytes:
         return [copy.deepcopy(record)]
     parent = _stub(record)
-    overhead = len(_canonical(_part(parent, b'', MAX_PARTS - 1, MAX_PARTS)))
+    max_parts = MAX_AFFECTED_PARTS if format_name == AFFECTED_FORMAT else MAX_PARTS
+    overhead = len(_canonical(_part(parent, b'', max_parts - 1, max_parts)))
     chunk_size = min(8192, (max_record_bytes - overhead) // 4 * 3)
     if chunk_size <= 0:
         raise ValueError('record identity exceeds continuation envelope ceiling')
     count = (len(data) + chunk_size - 1) // chunk_size
-    if count > MAX_PARTS:
+    if count > max_parts:
         raise ValueError('continuation part count exceeds ceiling')
     parts = [_part(parent, data[index * chunk_size:(index + 1) * chunk_size], index, count)
              for index in range(count)]
-    parent['continuation'] = {'format': FORMAT, 'parts': [part['record_id'] for part in parts],
+    parent['continuation'] = {'format': format_name, 'parts': [part['record_id'] for part in parts],
         'bytes': len(data), 'sha256': _digest(data), 'requires_reassembly': True}
+    if format_name == AFFECTED_FORMAT:
+        parent['continuation']['affected_count'] = len(record['affected'])
     result = [parent, *parts]
     if any(len(_canonical(item)) > max_record_bytes for item in result):
         raise ValueError('continuation envelope exceeds physical byte ceiling')
@@ -103,16 +121,26 @@ def join_record(parent: dict, records_by_id: Mapping[str, dict], *,
         if len(_canonical(parent)) > max_logical_bytes:
             raise ValueError('logical record exceeds byte ceiling')
         return copy.deepcopy(parent)
-    if (not isinstance(descriptor, dict) or set(descriptor) !=
-            {'format', 'parts', 'bytes', 'sha256', 'requires_reassembly'} or
-            descriptor['format'] != FORMAT or descriptor['requires_reassembly'] is not True):
+    if not isinstance(descriptor, dict):
         raise ValueError('unsupported continuation descriptor')
+    format_name = descriptor.get('format')
+    expected_keys = {'format', 'parts', 'bytes', 'sha256', 'requires_reassembly'}
+    if format_name == AFFECTED_FORMAT:
+        expected_keys.add('affected_count')
+    if (format_name not in (FORMAT, AFFECTED_FORMAT) or set(descriptor) != expected_keys
+            or descriptor['requires_reassembly'] is not True):
+        raise ValueError('unsupported continuation descriptor')
+    if format_name == AFFECTED_FORMAT and (type(descriptor['affected_count']) is not int
+            or descriptor['affected_count'] <= 0):
+        raise ValueError('invalid affected continuation item count')
+    max_parts = MAX_AFFECTED_PARTS if format_name == AFFECTED_FORMAT else MAX_PARTS
+    max_total_bytes = MAX_AFFECTED_BYTES if format_name == AFFECTED_FORMAT else max_logical_bytes
     ids = descriptor['parts']
     size = descriptor['bytes']
-    if (not isinstance(ids, list) or not 1 <= len(ids) <= MAX_PARTS or
+    if (not isinstance(ids, list) or not 1 <= len(ids) <= max_parts or
             any(not isinstance(identifier, str) for identifier in ids) or len(set(ids)) != len(ids)):
         raise ValueError('invalid continuation part inventory')
-    if type(size) is not int or not 0 < size <= max_logical_bytes:
+    if type(size) is not int or not 0 < size <= max_total_bytes:
         raise ValueError('invalid continuation logical byte count')
     chunks, total = [], 0
     for index, identifier in enumerate(ids):
@@ -135,7 +163,7 @@ def join_record(parent: dict, records_by_id: Mapping[str, dict], *,
         if _canonical(part) != _canonical(_part(parent, chunk, index, len(ids))):
             raise ValueError('continuation part metadata or hash mismatch')
         total += len(chunk)
-        if total > size or total > max_logical_bytes:
+        if total > size or total > max_total_bytes:
             raise ValueError('continuation decoded bytes exceed ceiling')
         chunks.append(chunk)
     data = b''.join(chunks)
@@ -149,6 +177,10 @@ def join_record(parent: dict, records_by_id: Mapping[str, dict], *,
         raise ValueError('nested or invalid logical continuation record')
     if _canonical(logical) != data:
         raise ValueError('noncanonical logical continuation JSON')
+    if _format(logical, len(data), max_logical_bytes) != format_name:
+        raise ValueError('continuation format does not match bounded logical structure')
+    if format_name == AFFECTED_FORMAT and len(logical['affected']) != descriptor['affected_count']:
+        raise ValueError('affected continuation item count mismatch')
     try:
         expected = _stub(logical)
     except KeyError:

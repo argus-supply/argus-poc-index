@@ -155,6 +155,42 @@ class SourceContracts(unittest.TestCase):
         self.assertIsNone(result.completed_watermark)
         self.assertIn('oversize_record', result.errors[0]['message'])
 
+    def test_cve_large_affected_array_uses_lossless_v2_without_multiple_advisories(self):
+        raw = cve('CVE-2026-12345')
+        raw['containers']['cna']['affected'] = [{'vendor': 'fixture', 'product': f'platform-{index}',
+            'versions': [{'version': f'{index}.0', 'lessThan': f'{index}.5', 'status': 'affected'}],
+            'packageName': 'original-package-' + 'x' * 80} for index in range(2712)]
+        def handler(url):
+            if '/commits/HEAD' in url:
+                return {'sha': REV}
+            if url.endswith('deltaLog.json'):
+                return [{'fetchTime': '2026-09-08T00:00:00Z', 'new': [{'cveId': 'CVE-2026-12345'}]},
+                        {'fetchTime': '2026-08-01T00:00:00Z', 'new': []}]
+            return raw
+        policy = load_policy(ROOT / 'policy.json')
+        result = collect('cve', HTTP(handler), {}, now=NOW, policy={**policy, 'bootstrap_days': 30})
+        self.assertEqual(result.status, 'ok', result.errors)
+        self.assertEqual(result.completed_watermark, NOW)
+        self.assertEqual(len(result.records), 1)
+        self.assertEqual(len(result.records[0]['affected']), 2712)
+        self.assertEqual(result.records[0]['affected'], normalize_cve(raw, REV)['affected'])
+        self.assertGreater(len(stored_json(result.records[0])), 262144)
+        records, events, sources = {}, {}, {}
+        apply_result(records, events, sources, 'cve', result, NOW, policy)
+        files, manifest = build_snapshot('argus-supply/argus-intel-data', records, events, sources,
+            policy, NOW, 'fixture')
+        restored, restored_events, _, _ = read_snapshot(files)
+        self.assertEqual(restored, records)
+        self.assertEqual(len(restored), 1)
+        self.assertEqual(len(restored_events), 1)
+        self.assertEqual({event['event_type'] for event in restored_events.values()}, {'disclosure'})
+        physical = [json.loads(line) for descriptor in manifest['shards'] if descriptor['kind'] == 'records'
+                    for line in files[descriptor['path']].splitlines()]
+        parent = next(row for row in physical if row['kind'] != 'continuation')
+        self.assertEqual(parent['continuation']['format'], 'json-affected-v2')
+        self.assertEqual(parent['continuation']['affected_count'], 2712)
+        self.assertTrue(all(len(stored_json(row)) <= 16384 for row in physical))
+
     def test_cve_bootstrap_publishes_recent_seven_days_before_older_backfill(self):
         def handler(url):
             if '/commits/HEAD' in url:
