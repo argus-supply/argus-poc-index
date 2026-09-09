@@ -10,7 +10,9 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from sync.adapters import (AdapterResult, CVE, Run, collect, cve_path, normalize_cve, normalize_ghsa,
-                           normalize_kev, normalize_template, normalize_nuclei_auxiliary, NUCLEI_AUXILIARY, raw_url)
+                           normalize_kev, normalize_template, normalize_nuclei_auxiliary, NUCLEI_AUXILIARY,
+                           normalize_nuclei_aggregate, NUCLEI_AGGREGATE, NUCLEI_AGGREGATE_MAX_BYTES,
+                           NUCLEI_AGGREGATE_MAX_MATCHERS, raw_url)
 from sync.core import ROOT, apply_result, build_snapshot, canonical as stored_json, load_policy, read_snapshot
 from sync.gitstore import GitStore
 from sync.http import BudgetExceeded, FetchError, Http
@@ -985,6 +987,127 @@ class SourceContracts(unittest.TestCase):
         self.assertEqual(dependency['sha256'], hashlib.sha256(mapping).hexdigest())
         self.assertEqual(dependency['blob_sha'], result.state['auxiliary_files'][NUCLEI_AUXILIARY]['blob_sha'])
         self.assertEqual(result.authoritative_ids, ['nuclei/http/technologies/a.yaml'])
+
+    def aggregate_block(self, name='plugin-one'):
+        return (f'      - type: dsl\n        name: {name}\n        dsl:\n'
+                f'          - \'regex("/plugins/{name}/", body)\'\n'
+                '          - \'status_code == 200\'\n        condition: and\n').encode()
+
+    def aggregate_template(self, blocks=None):
+        header = ('id: wordpress-plugin-detect\ninfo:\n  name: Wordpress Plugin Detection\n'
+                  '  tags: tech,wordpress,plugin\nhttp:\n  - method: GET\n'
+                  '    path: ["{{BaseURL}}"]\n    host-redirects: true\n    max-redirects: 2\n'
+                  '    matchers-condition: or\n    matchers:\n').encode()
+        return header + (blocks if blocks is not None else self.aggregate_block()) + b'# digest: aa:bb\n'
+
+    def aggregate_row(self, data, path=NUCLEI_AGGREGATE, revision=REV):
+        blob = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+        return normalize_nuclei_aggregate(data, path, revision, blob)
+
+    def aggregate_collect(self, data, *, revision=REV, previous=None, units=400, remove=False):
+        later = 'http/technologies/wordpress/plugins/z-after.yaml'
+        bodies = {later: self.template(), **({NUCLEI_AGGREGATE: data} if not remove else {})}
+        entries = [{'type': 'blob', 'mode': '100644', 'path': path, 'size': len(body),
+            'sha': hashlib.sha1(b'blob ' + str(len(body)).encode() + b'\0' + body).hexdigest()}
+            for path, body in bodies.items()]
+        def handler(url):
+            if '/commits/HEAD' in url:
+                return {'sha': revision}
+            if '/git/trees/' in url:
+                return {'truncated': False, 'tree': entries}
+            return bodies[url.split('/' + revision + '/', 1)[1]]
+        return collect('nuclei', HTTP(handler), previous or {}, now=NOW, policy={'adapter_max_units': units})
+
+    def test_nuclei_aggregate_validates_full_large_source_with_bounded_metadata(self):
+        count = 15000
+        data = self.aggregate_template((self.aggregate_block() + b'\n') * count)
+        self.assertGreater(len(data), 2 * 1024 * 1024)
+        row = self.aggregate_row(data)
+        self.assertEqual(row['aggregate']['matcher_count'], count)
+        self.assertEqual(row['sha256'], hashlib.sha256(data).hexdigest())
+        self.assertEqual(row['bytes'], len(data))
+        self.assertEqual(row['protocols'], ['http'])
+        self.assertEqual(row['dependencies'], [])
+        self.assertFalse(row['content_retrievable'])
+        self.assertEqual(row['content_retrieval']['max_bytes'], 2 * 1024 * 1024)
+        self.assertFalse(row['verification']['executed'])
+        self.assertFalse(row['requirements']['code'])
+        self.assertFalse(row['requirements']['browser'])
+        self.assertFalse(row['requirements']['out_of_band'])
+        self.assertLess(len(stored_json(row)), 16384)
+
+    def test_nuclei_aggregate_same_filename_elsewhere_keeps_original_size_limit(self):
+        data = self.aggregate_template((self.aggregate_block() + b'\n') * 15000)
+        path = 'http/unrelated/wordpress-plugin-detect.yaml'
+        with self.assertRaisesRegex(ValueError, 'unsupported Nuclei aggregate source'):
+            self.aggregate_row(data, path)
+        with self.assertRaisesRegex(ValueError, 'oversize template'):
+            self.template_row(data, path)
+
+    def test_nuclei_aggregate_rejects_hash_source_size_matcher_and_line_bounds(self):
+        data = self.aggregate_template()
+        with self.assertRaisesRegex(ValueError, 'blob hash mismatch'):
+            normalize_nuclei_aggregate(data, NUCLEI_AGGREGATE, REV, '0' * 40)
+        with self.assertRaisesRegex(ValueError, 'unsupported Nuclei aggregate source'):
+            self.aggregate_row(data, revision='HEAD')
+        with self.assertRaisesRegex(ValueError, 'oversize Nuclei aggregate'):
+            self.aggregate_row(b'x' * (NUCLEI_AGGREGATE_MAX_BYTES + 1))
+        excessive = self.aggregate_template(self.aggregate_block('x') * (NUCLEI_AGGREGATE_MAX_MATCHERS + 1))
+        self.assertLess(len(excessive), NUCLEI_AGGREGATE_MAX_BYTES)
+        with self.assertRaisesRegex(ValueError, 'matcher count exceeds bound'):
+            self.aggregate_row(excessive)
+        with self.assertRaisesRegex(ValueError, 'line exceeds bound'):
+            self.aggregate_row(data.replace(b'name: Wordpress Plugin Detection', b'name: ' + b'x' * 4096))
+        with self.assertRaisesRegex(ValueError, 'oversized Nuclei aggregate header'):
+            self.aggregate_row(data.replace(b'info:\n', b'info:\n' + b'  # bounded comment\n' * 1000))
+
+    def test_nuclei_aggregate_extra_protocol_request_dependency_or_dynamic_expression_is_rejected(self):
+        data = self.aggregate_template()
+        variations = [data.replace(b'http:\n', b'code: []\nhttp:\n'),
+            data.replace(b'http:\n', b'http:\n  - method: POST\n    path: ["{{BaseURL}}"]\n'),
+            data.replace(b'    matchers:\n', b'    payloads: {users: helpers/users.txt}\n    matchers:\n'),
+            data.replace(b'    matchers:\n', b'    headers: {Authorization: "{{token}}"}\n    matchers:\n'),
+            data.replace(b"'status_code == 200'", b"'read_file(\"/tmp/unknown\")'"),
+            data.replace(b'/plugins/plugin-one/', b'/plugins/different/'),
+            data + b'javascript: []\n',
+            data.replace(b'id: wordpress-plugin-detect', b'id: another-template')]
+        for value in variations:
+            with self.subTest(value=value[:70]), self.assertRaises(ValueError):
+                self.aggregate_row(value)
+
+    def test_nuclei_aggregate_malformed_middle_keeps_entire_unit_and_watermark_pending(self):
+        data = self.aggregate_template(self.aggregate_block('one') + b'    unknown: true\n' + self.aggregate_block('two'))
+        result = self.aggregate_collect(data)
+        self.assertEqual(result.status, 'partial')
+        self.assertEqual(result.records, [])
+        self.assertEqual(result.continuation['offset'], 0)
+        self.assertIsNone(result.completed_watermark)
+        self.assertIsNone(result.authoritative_ids)
+
+    def test_nuclei_aggregate_resume_change_and_deletion_use_normal_resource_events(self):
+        data = self.aggregate_template()
+        first = self.aggregate_collect(data, units=1)
+        self.assertEqual(first.status, 'partial')
+        self.assertEqual(first.continuation['offset'], 1)
+        self.assertEqual(first.records[0]['path'], NUCLEI_AGGREGATE)
+        final = self.aggregate_collect(data, previous={'records': first.records, 'state': first.state})
+        self.assertEqual(final.status, 'ok', final.errors)
+        policy = load_policy(ROOT / 'policy.json')
+        records, events, sources = {}, {}, {}
+        apply_result(records, events, sources, 'nuclei', first, NOW, policy)
+        apply_result(records, events, sources, 'nuclei', final, NOW, policy)
+        self.assertEqual(len(records), 2)
+        self.assertEqual({event['event_type'] for event in events.values()}, {'template_added'})
+        changed = self.aggregate_collect(self.aggregate_template(self.aggregate_block('different')), revision=OLDER,
+            previous={'records': list(records.values()), 'state': sources['nuclei']})
+        self.assertEqual(changed.status, 'ok', changed.errors)
+        apply_result(records, events, sources, 'nuclei', changed, NOW, policy)
+        self.assertIn('template_logic_changed', {event['event_type'] for event in events.values()})
+        removed = self.aggregate_collect(data, revision='c' * 40, remove=True,
+            previous={'records': list(records.values()), 'state': sources['nuclei']})
+        apply_result(records, events, sources, 'nuclei', removed, NOW, policy)
+        self.assertEqual(records['nuclei/' + NUCLEI_AGGREGATE]['status'], 'source_deleted')
+        self.assertIn('source_deleted', {event['event_type'] for event in events.values()})
 
     def test_non_url_template_references_are_inert_text_with_warnings(self):
         references = ['https://example.com/advisory', 'Vendor advisory DOC-123',

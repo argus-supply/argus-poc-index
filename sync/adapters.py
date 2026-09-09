@@ -30,6 +30,9 @@ REPOS = {'cve': 'CVEProject/cvelistV5', 'ghsa': 'github/advisory-database',
          'kev': 'cisagov/kev-data', 'poc-in-github': 'nomi-sec/PoC-in-GitHub',
          'nuclei': 'projectdiscovery/nuclei-templates'}
 NUCLEI_AUXILIARY = 'http/technologies/wappalyzer-mapping.yml'
+NUCLEI_AGGREGATE = 'http/technologies/wordpress/plugins/wordpress-plugin-detect.yaml'
+NUCLEI_AGGREGATE_MAX_BYTES = 12 * 1024 * 1024
+NUCLEI_AGGREGATE_MAX_MATCHERS = 65536
 
 
 @dataclass
@@ -268,6 +271,11 @@ def normalize_template(data, path, revision, blob_sha, *, max_bytes=2 * 1024 * 1
     if actual_blob != blob_sha:
         raise ValueError('template blob hash mismatch')
     raw = yaml.load(data, Loader=MetadataLoader)
+    return template_metadata(raw, data, path, revision, blob_sha)
+
+
+def template_metadata(raw, data, path, revision, blob_sha):
+    """Project validated template metadata while retaining the complete source identity."""
     if not isinstance(raw, dict) or not isinstance(raw.get('id'), str) or not isinstance(raw.get('info'), dict):
         raise ValueError('invalid template metadata')
     info = raw['info']
@@ -289,7 +297,6 @@ def normalize_template(data, path, revision, blob_sha, *, max_bytes=2 * 1024 * 1
             aliases.update(GHSA.findall(value))
     protocols = [x for x in ('http', 'requests', 'tcp', 'network', 'headless', 'code', 'file', 'dns', 'ssl', 'javascript') if x in raw]
     metadata = info.get('metadata') or {}
-    text = data.decode('utf-8')
     dependency_paths = set()
     for protocol in ('http', 'requests', 'tcp', 'network'):
         for request in raw.get(protocol, []):
@@ -310,7 +317,7 @@ def normalize_template(data, path, revision, blob_sha, *, max_bytes=2 * 1024 * 1
         'engine': {'name': 'nuclei', 'minimum_version': metadata.get('min-version') or raw.get('minimum-version')},
         'dependencies': [{'path': p, 'revision': revision, 'status': 'unresolved'} for p in sorted(dependency_paths)],
         'requirements': {'authentication': 'required' if any(x in tags for x in ('auth', 'authenticated')) else None,
-            'browser': 'headless' in raw, 'out_of_band': '{{interactsh-url}}' in text,
+            'browser': 'headless' in raw, 'out_of_band': b'{{interactsh-url}}' in data,
             'code': 'code' in raw or 'javascript' in raw, 'configuration': None},
         'verification': {'status': 'metadata-only', 'executed': False}})
     row['references'] = []
@@ -325,6 +332,84 @@ def normalize_template(data, path, revision, blob_sha, *, max_bytes=2 * 1024 * 1
                 'reference_index': len(row['references']) - 1})
         else:
             row['references'].append({'url': url})
+    return row
+
+
+def normalize_nuclei_aggregate(data, path, revision, blob_sha):
+    """Validate every block of the known generated WordPress HTTP signature template.
+
+    The exception is a bounded grammar for this exact path and template ID, not
+    a larger generic YAML limit. Every matcher is the same inert DSL form; an
+    unknown protocol, request, dependency, tag, or trailing structure is refused.
+    The original byte stream is hashed completely and is never executed.
+    """
+    if path != NUCLEI_AGGREGATE or not SHA.fullmatch(revision):
+        raise ValueError('unsupported Nuclei aggregate source')
+    if len(data) > NUCLEI_AGGREGATE_MAX_BYTES:
+        raise ValueError('oversize Nuclei aggregate template')
+    actual_blob = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+    if actual_blob != blob_sha:
+        raise ValueError('Nuclei aggregate blob hash mismatch')
+    stream = io.BytesIO(data)
+
+    def line():
+        value = stream.readline(4097)
+        if len(value) > 4096:
+            raise ValueError('Nuclei aggregate line exceeds bound')
+        return value
+
+    header = bytearray()
+    while True:
+        value = line()
+        if not value or len(header) + len(value) > 16384:
+            raise ValueError('missing or oversized Nuclei aggregate header')
+        header.extend(value)
+        if value == b'    matchers:\n':
+            break
+    raw = yaml.load(bytes(header), Loader=MetadataLoader)
+    if (not isinstance(raw, dict) or set(raw) != {'id', 'info', 'http'}
+            or raw['id'] != 'wordpress-plugin-detect' or not isinstance(raw['info'], dict)
+            or not isinstance(raw['http'], list) or len(raw['http']) != 1):
+        raise ValueError('unsupported Nuclei aggregate top-level structure')
+    request = raw['http'][0]
+    expected = {'method': 'GET', 'path': ['{{BaseURL}}'], 'host-redirects': True,
+                'max-redirects': 2, 'matchers-condition': 'or', 'matchers': None}
+    if (request != expected or type(request.get('host-redirects')) is not bool
+            or type(request.get('max-redirects')) is not int):
+        raise ValueError('unsupported Nuclei aggregate request or dependency')
+    count, matcher_digest = 0, hashlib.sha256()
+    pattern = re.compile(rb"      - type: dsl\n        name: ([A-Za-z0-9._-]{1,256})\n        dsl:\n"
+        rb"          - 'regex\(\"/plugins/([A-Za-z0-9._-]{1,256})/\", body\)'\n"
+        rb"          - 'status_code == 200'\n        condition: and\n")
+    while value := line():
+        if value == b'\n':
+            continue
+        if value.startswith(b'# digest: '):
+            if not re.fullmatch(rb'# digest: [0-9a-f]+:[0-9a-f]+\n?', value):
+                raise ValueError('invalid Nuclei aggregate digest comment')
+            while trailing := line():
+                if trailing != b'\n':
+                    raise ValueError('unexpected structure after Nuclei aggregate digest')
+            break
+        if value != b'      - type: dsl\n':
+            raise ValueError('unsupported Nuclei aggregate matcher structure')
+        block = value + b''.join(line() for _ in range(5))
+        match = pattern.fullmatch(block)
+        if not match or match[1] != match[2]:
+            raise ValueError('unsupported Nuclei aggregate matcher expression')
+        count += 1
+        if count > NUCLEI_AGGREGATE_MAX_MATCHERS:
+            raise ValueError('Nuclei aggregate matcher count exceeds bound')
+        matcher_digest.update(block)
+    if not count:
+        raise ValueError('Nuclei aggregate contains no verified matchers')
+    row = template_metadata(raw, data, path, revision, blob_sha)
+    retrievable = len(data) <= 2 * 1024 * 1024
+    row.update(aggregate={'kind': 'wordpress-plugin-signatures', 'matcher_count': count,
+        'matcher_blocks_sha256': matcher_digest.hexdigest(), 'structure_validation': 'complete-bounded-grammar'},
+        content_retrievable=retrievable, content_retrieval={'status': 'within-service-content-limit' if retrievable else 'exceeds-service-content-limit',
+            'max_bytes': 2 * 1024 * 1024,
+            'reason': 'Full source validated for metadata; the existing content endpoint remains limited to 2 MiB.'})
     return row
 
 
@@ -1059,7 +1144,8 @@ class Run:
             self.unit()
             if inventory[path]['mode'] not in ('100644', '100755'):
                 raise ValueError(f'unsupported template symlink:{path}')
-            size_limit = self.policy.get('resource_max_bytes', 2 * 1024 * 1024)
+            size_limit = (NUCLEI_AGGREGATE_MAX_BYTES if path == NUCLEI_AGGREGATE
+                          else self.policy.get('resource_max_bytes', 2 * 1024 * 1024))
             if (inventory[path]['size'] or 0) > size_limit:
                 raise ValueError(f'oversize template:{path}')
             data = self.http.get_bytes(raw_url(repo, revision, path))
@@ -1070,7 +1156,8 @@ class Run:
                 self.state['auxiliary_files'] = auxiliary
                 self.cursor['offset'] = index + 1
                 continue
-            row = normalize_template(data, path, revision, inventory[path]['sha'], max_bytes=size_limit)
+            row = (normalize_nuclei_aggregate(data, path, revision, inventory[path]['sha']) if path == NUCLEI_AGGREGATE
+                   else normalize_template(data, path, revision, inventory[path]['sha'], max_bytes=size_limit))
             total = len(data)
             for dependency in row['dependencies']:
                 dep_path = dependency['path']

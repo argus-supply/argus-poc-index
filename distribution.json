@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
   "source_repository": "ARGUS application services/argus-data-sync",
-  "source_commit": "cac044ea4b8419a919b176740b78706566b0595d",
+  "source_commit": "8ceb98f415429b87e56a0345e3ba72885b3535da",
   "files": {
     "fixtures/continuations/physical-records.json": "79527a407e5c6766ef2088551286349656b001811c8616f296ed596372cad041",
     "fixtures/continuations/source-record.json": "b577f1fb5bc50ed3bed23b92e96da7ba3246cb1530fd6e3d2403aa64e0b2a7c3",
@@ -17,7 +17,7 @@
     "schemas/record.schema.json": "c704af1eea9e37b1ca974c44cd2edf5c81c4544954edb4ef9b04b28fc5fa754e",
     "sources.json": "ef0b25a109b097513b938a84ce1d415909ead564ef1ec77d6080b8a097d65a0e",
     "sync/__init__.py": "1616a3cbba3b1d36ce8ade6e22d630f81063ddffac090946c13d452d71e50ca5",
-    "sync/adapters.py": "539df91ed0992dc2d4df632266ee203ace7662f2afb0bcc7d720e29b2804f10d",
+    "sync/adapters.py": "26720cdcec5c1ac5e3dad44c8ad9029dc2cc627059c3752641adc921641da5b4",
     "sync/availability.py": "cd429d50df8a8925aab3b6bb088c6b49371d42db0a39f52b8e76c93d1be713f1",
     "sync/continuations.py": "51e010280f712bc44442d4aec951034a35e0884a1af1df8c755b29f9ef8925d3",
     "sync/core.py": "4f20315afb3f970b6938a3b0fad5905e31ea18a46180332334359ef36c63a61d",
@@ -27,7 +27,7 @@
     "sync/http.py": "8939cf508c2e1d39cf680c080682d5af26a8e6ce432228587e390b9d61918d1e",
     "sync/ledger.py": "930a8219b1eeedad07d0b9d91d8c28851f8b5d75b7e5b465a46d45e35b0dd123",
     "sync/run.py": "30c50069b20bec4dce67a5498b7cc3d50a45a153d3a15c7b13888684c4d657ad",
-    "tests/test_adapters.py": "a97728a0c107df4d05e6aabb576f1cda7774dce0dc50b60c9989ca2f27cc5e1f",
+    "tests/test_adapters.py": "f394b112378e5d0b0d76bca9541f9aea9d5dc9ac8f20b6603d90627f350e099f",
     "tests/test_availability.py": "9d446cc681287cad68ce850b2bbbeceb0d0f64b967910334e477698e308c8b8d",
     "tests/test_baseline_correction.py": "045bac6be397a92545f72e6a3e1d9387afc20536191ee42c4d775b28d9886cb3",
     "tests/test_continuations.py": "9e21419dc856ed789252e8d305e1d1aeb89ca8181255ed6a4136777e97bb2d5a",
