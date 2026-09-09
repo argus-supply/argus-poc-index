@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 import time
 import zlib
 import urllib.error
@@ -24,6 +26,29 @@ HOSTS = frozenset(('api.github.com', 'raw.githubusercontent.com', 'gitlab.com',
     'www.cve.org', 'www.cisa.gov'))
 
 
+def reference_allowed(url):
+    """Only canonical public repository roots and numeric Exploit-DB references."""
+    if not isinstance(url, str) or len(url) > 512:
+        raise FetchError('reference URL is outside checked scope')
+    # Match the complete URL before parsing: ports, userinfo, encoded paths,
+    # whitespace, query strings, fragments and navigation paths are all refused.
+    github = re.fullmatch(r'https://github\.com/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/'
+                         r'([A-Za-z0-9_][A-Za-z0-9_.-]{0,99})', url)
+    exploitdb = re.fullmatch(r'https://www\.exploit-db\.com/exploits/[1-9][0-9]{0,9}', url)
+    if not github and not exploitdb:
+        raise FetchError('reference URL is outside checked scope')
+    if github and (github[1].endswith('-') or '..' in github[2] or github[2].endswith('.git')):
+        raise FetchError('reference URL is not canonical')
+    reserved = {'about', 'account', 'accounts', 'advisories', 'apps', 'blog', 'collections',
+        'contact', 'customer-stories', 'enterprise', 'events', 'explore', 'features', 'gist',
+        'issues', 'join', 'login', 'logout', 'marketplace', 'new', 'notifications', 'orgs',
+        'organizations', 'pricing', 'pulls', 'search', 'security', 'sessions', 'settings',
+        'site', 'sponsors', 'stars', 'topics', 'trending', 'users'}
+    if github and github[1].lower() in reserved:
+        raise FetchError('GitHub navigation route is outside checked scope')
+    return url
+
+
 def allowed(url):
     parsed = urllib.parse.urlsplit(url)
     if (parsed.scheme != 'https' or parsed.hostname not in HOSTS or parsed.username
@@ -34,6 +59,10 @@ def allowed(url):
 
 class Redirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if req.get_method() == 'HEAD':
+            if fp is not None:
+                fp.close()
+            raise FetchError('reference redirect refused', status=code)
         origin, destination = allowed(req.full_url), allowed(newurl)
         if origin.hostname != destination.hostname:
             raise FetchError('cross-origin redirect refused')
@@ -143,3 +172,45 @@ class Http:
             return json.loads(self.get_bytes(url, headers))
         except (ValueError, UnicodeError):
             raise FetchError('invalid upstream JSON') from None
+
+    def head_reference(self, url):
+        """Anonymous HEAD only; retries share the caller's durable reservation."""
+        reference_allowed(url)
+        request = urllib.request.Request(url, method='HEAD', headers={
+            'User-Agent': 'ARGUS-reference-check/1.0', 'Accept-Encoding': 'identity'})
+        for attempt in range(self.policy['reference_probe_retries'] + 1):
+            self._before()
+            status, retry_after = None, 0
+            try:
+                remaining = self.policy['job_seconds'] - (self.clock() - self.started)
+                if remaining <= 0:
+                    raise BudgetExceeded('job time budget exhausted')
+                timeout = min(self.policy['reference_probe_timeout_seconds'], remaining)
+                with self.opener.open(request, timeout=timeout) as response:
+                    status = response.status
+                    if 200 <= status < 300:
+                        return status
+                    raise FetchError('reference HTTP ' + str(status), status=status)
+            except urllib.error.HTTPError as error:
+                status = error.code
+                # HEAD has no response body; never fall back to GET or consume
+                # content. Close even an error response immediately.
+                error.close()
+                if status not in (429, 500, 502, 503, 504):
+                    raise FetchError('reference HTTP ' + str(status), status=status) from None
+                try:
+                    retry_after = float(error.headers.get('Retry-After', 0))
+                    if not math.isfinite(retry_after):
+                        retry_after = self.policy['http_retry_after_max_seconds'] + 1
+                except (TypeError, ValueError):
+                    retry_after = self.policy['http_retry_after_max_seconds'] + 1
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+                pass
+            reason = 'reference HTTP ' + str(status) if status else 'reference transport failure'
+            if attempt == self.policy['reference_probe_retries']:
+                raise FetchError(reason + '; retries exhausted', status=status) from None
+            delay = max(retry_after, self.policy['http_backoff_seconds'] * 2 ** attempt)
+            if delay > self.policy['http_retry_after_max_seconds'] or delay >= self.policy['job_seconds'] - (self.clock() - self.started):
+                raise FetchError(reason + '; retry deferred', status=status)
+            self.sleep(delay)
+        raise AssertionError('unreachable reference retry exhaustion')

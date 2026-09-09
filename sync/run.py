@@ -9,10 +9,11 @@ from pathlib import Path
 import time
 
 from .adapters import AdapterResult, collect
-from .core import ROOT, apply_result, build_snapshot, canonical, digest, load_policy, read_snapshot, utcnow
+from .core import ROOT, apply_result, build_snapshot, canonical, digest, expire, load_policy, read_snapshot, utcnow
 from .gitstore import GitStore, Ledger, ParentMoved
 from .http import BudgetExceeded, Http
 from .dependency import consume_intel
+from .availability import refresh as refresh_reference_availability
 
 REPOSITORIES = ('argus-intel-data', 'argus-poc-index', 'argus-detection-resources')
 
@@ -73,12 +74,18 @@ def run(repository, remote, work, job_id, *, policy, token=None, manual=False, h
             metrics['sources'][source_id] = {'status': sources[source_id]['status'],
                 'bytes': local.bytes, 'requests': local.requests,
                 'coverage_gaps': sources[source_id]['coverage_gaps'], 'errors': sources[source_id]['errors']}
+        extra = {'dependency_cache': dependency_cache} if dependency_cache else {}
+        if repository == 'argus-poc-index':
+            expire(records, events, now, policy)
+            checkpoint, metrics['reference_availability'] = refresh_reference_availability(
+                records, (previous or {}).get('reference_availability'), client, now, policy)
+            extra['reference_availability'] = checkpoint
         provenance_path = ROOT / 'distribution.json'
         version = json.loads(provenance_path.read_text())['source_commit'] if provenance_path.exists() else 'working-tree'
         for attempt in range(3):
             files, manifest = build_snapshot('argus-supply/' + repository, records, events, sources,
                 policy, now, version, previous, dependencies,
-                {'dependency_cache': dependency_cache} if dependency_cache else None)
+                extra)
             files.update(dependency_files)
             if sum(map(len, files.values())) > policy['max_tree_bytes']:
                 raise ValueError('current data tree including dependency cache exceeds budget')

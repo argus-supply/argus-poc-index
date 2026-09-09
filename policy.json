@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "policy_version": "2026-09-09.2",
+  "policy_version": "2026-09-09.3",
   "retention_days": 30,
   "event_days": 30,
   "bootstrap_days": 7,
@@ -29,6 +29,13 @@
   "http_retries": 2,
   "http_backoff_seconds": 1,
   "http_retry_after_max_seconds": 30,
+  "reference_probe_requests": 4,
+  "reference_probe_retries": 1,
+  "reference_probe_timeout_seconds": 5,
+  "reference_probe_bytes": 8192,
+  "reference_probe_entries": 128,
+  "reference_probe_state_bytes": 65536,
+  "reference_recheck_hours": 24,
   "max_source_state_bytes": 524288,
   "allowed_template_protocols": ["http", "network", "tcp"],
   "schedules": {

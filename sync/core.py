@@ -39,10 +39,18 @@ def validator(kind):
 
 def validate(kind, value):
     validator(kind).validate(value)
+    if kind == 'manifest' and len(canonical(value.get('reference_availability', {}))) > 65536:
+        raise ValueError('reference availability checkpoint exceeds 64 KiB bound')
+    if kind == 'manifest':
+        for entry in value.get('reference_availability', {}).get('entries', {}).values():
+            if instant(entry['next_check_at']) <= instant(entry['checked_at']):
+                raise ValueError('invalid reference recheck interval')
 
 
 def load_policy(path):
+    from .availability import validate_policy
     policy = json.loads(Path(path).read_text())
+    validate_policy(policy)
     ceilings = {'max_record_bytes': 16384, 'max_shard_bytes': 524288,
         'max_tree_bytes': 33554432, 'job_seconds': 720, 'job_requests': 500,
         'job_bytes': 67108864, 'daily_bytes': 10485760, 'consumer_daily_bytes': 4194304,
@@ -272,6 +280,8 @@ def build_snapshot(repository, records, events, sources, policy, now, collector_
             manifest = previous
     validate('manifest', manifest)
     files['manifest.json'] = canonical(manifest)
+    if len(files['manifest.json']) > 512 * 1024:
+        raise ValueError('manifest exceeds consumer 512 KiB bound')
     if sum(map(len, files.values())) > policy['max_tree_bytes']:
         raise ValueError('current data tree budget exceeded')
     return files, manifest
