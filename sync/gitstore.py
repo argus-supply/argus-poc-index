@@ -1,7 +1,7 @@
 """Atomic Git snapshots and compare-and-swap UTC-day reservations.
 
-Only the named branch is fetched at depth one. New commits reference its observed
-parent; ordinary non-force push rejects concurrent parent movement.
+All authorized remote branch tips are observed as bounded shallow snapshots. New
+commits reference the observed parent; ordinary non-force push rejects races.
 """
 from __future__ import annotations
 
@@ -11,7 +11,8 @@ import os
 from pathlib import Path
 import subprocess
 import uuid
-import math
+import re
+import urllib.request
 
 from .core import canonical, utcnow
 from .http import BudgetExceeded
@@ -25,13 +26,23 @@ class GitStore:
     def __init__(self, path, remote, token=None):
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
-        self.env = dict(os.environ, GIT_TERMINAL_PROMPT='0',
+        self.env = dict(os.environ, GIT_TERMINAL_PROMPT='0', GIT_TRACE='0', GIT_TRACE_CURL='0', GIT_CURL_VERBOSE='0',
             GIT_AUTHOR_NAME='ARGUS data sync', GIT_AUTHOR_EMAIL='sync@argus.invalid',
             GIT_COMMITTER_NAME='ARGUS data sync', GIT_COMMITTER_EMAIL='sync@argus.invalid')
         if token:
             credential = base64.b64encode(('x-access-token:' + token).encode()).decode()
             self.env.update(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='http.https://github.com/.extraheader',
                             GIT_CONFIG_VALUE_0='AUTHORIZATION: basic ' + credential)
+        proxy = urllib.request.getproxies().get('https')
+        if proxy:
+            count = int(self.env.get('GIT_CONFIG_COUNT', '0'))
+            self.env.update(GIT_CONFIG_COUNT=str(count + 1))
+            self.env['GIT_CONFIG_KEY_' + str(count)] = 'http.proxy'
+            self.env['GIT_CONFIG_VALUE_' + str(count)] = proxy
+        count = int(self.env.get('GIT_CONFIG_COUNT', '0'))
+        self.env['GIT_CONFIG_COUNT'] = str(count + 1)
+        self.env['GIT_CONFIG_KEY_' + str(count)] = 'http.version'
+        self.env['GIT_CONFIG_VALUE_' + str(count)] = 'HTTP/1.1'
         self.remote = remote
         if not (self.path / 'HEAD').exists():
             self.run('init', '--bare')
@@ -43,15 +54,30 @@ class GitStore:
             raise RuntimeError('git operation failed: ' + args[0])
         return result
 
+    def observe_heads(self):
+        """Pin every authorized remote branch; unknown branches require review."""
+        result = self.run('ls-remote', '--heads', self.remote)
+        tips = {}
+        for line in result.stdout.decode().splitlines():
+            sha, ref = line.split()
+            if ref not in ('refs/heads/main', 'refs/heads/data', 'refs/heads/control') or not re.fullmatch(r'[a-f0-9]{40}', sha):
+                raise ValueError('unexpected remote branch or object format')
+            tips[ref] = sha
+            if self.run('cat-file', '-e', sha + '^{commit}', check=False).returncode:
+                self.run('fetch', '--depth=1', '--no-tags', self.remote, sha)
+        return tips
+
     def read(self, branch, revision=None):
-        if branch not in ('data', 'control'):
+        if branch not in ('main', 'data', 'control'):
             raise ValueError('unsupported publication branch')
-        result = self.run('ls-remote', '--heads', self.remote, f'refs/heads/{branch}')
-        if not result.stdout.strip():
+        tips = self.observe_heads()
+        sha = revision or tips.get('refs/heads/' + branch)
+        if sha is None:
             return None, {}
-        # Fetch resolves one immutable snapshot even if ls-remote raced.
-        self.run('fetch', '--depth=1', '--no-tags', self.remote, revision or f'refs/heads/{branch}')
-        sha = self.run('rev-parse', 'FETCH_HEAD').stdout.decode().strip()
+        if not re.fullmatch(r'[a-f0-9]{40}', sha):
+            raise ValueError('invalid snapshot revision')
+        if self.run('cat-file', '-e', sha + '^{commit}', check=False).returncode:
+            self.run('fetch', '--depth=1', '--no-tags', self.remote, sha)
         entries = self.run('ls-tree', '-rz', sha).stdout
         files, objects = {}, []
         for entry in entries.split(b'\0'):
@@ -76,7 +102,9 @@ class GitStore:
             offset += size + 1
         return sha, files
 
-    def publish(self, branch, parent, files, message):
+    def prepare(self, branch, parent, files, message):
+        if branch not in ('main', 'data', 'control'):
+            raise ValueError('unsupported publication branch')
         staging = 'refs/heads/staging-' + branch + '-' + uuid.uuid4().hex
         commands = [f'commit {staging}\n'.encode(),
             b'committer ARGUS data sync <sync@argus.invalid> now\n',
@@ -95,6 +123,11 @@ class GitStore:
         tree = self.run('rev-parse', sha + '^{tree}').stdout.decode().strip()
         if parent and tree == self.run('rev-parse', parent + '^{tree}').stdout.decode().strip():
             return parent, False
+        return sha, True
+
+    def push_prepared(self, branch, sha):
+        if branch not in ('main', 'data', 'control'):
+            raise ValueError('unsupported publication branch')
         # No force, force-with-lease, history deletion or application remote here.
         result = self.run('push', self.remote, f'{sha}:refs/heads/{branch}', check=False)
         if result.returncode:
@@ -103,91 +136,9 @@ class GitStore:
             raise RuntimeError('git publication failed')
         return sha, True
 
+    def publish(self, branch, parent, files, message):
+        sha, changed = self.prepare(branch, parent, files, message)
+        return self.push_prepared(branch, sha) if changed else (sha, False)
 
-class Ledger:
-    """Control-branch reservations survive killed jobs and fresh runners."""
-    def __init__(self, store, policy, day=None):
-        self.store, self.policy = store, policy
-        self.day = day or utcnow()[:10]
 
-    def read(self):
-        parent, files = self.store.read('control')
-        self.health = files.get('health.json')
-        ledger = json.loads(files.get('ledger.json', b'{}'))
-        if ledger.get('day') != self.day:
-            ledger = {'schema_version': '1.0', 'day': self.day, 'reservations': {},
-                'history_upper_bound_bytes': ledger.get('history_upper_bound_bytes', 0),
-                'runner_month': self.day[:7],
-                'runner_minutes_used': ledger.get('runner_minutes_used', 0) if ledger.get('runner_month') == self.day[:7] else 0,
-                'daily_history': {day: value for day, value in ledger.get('daily_history', {}).items()
-                                  if day >= self.day[:8] + '01'}}
-        return parent, ledger
-
-    def files(self, ledger, health=None):
-        files = {'ledger.json': canonical(ledger)}
-        current = canonical(health) if health is not None else self.health
-        if current:
-            if len(current) > 65536:
-                raise ValueError('health summary exceeds 64 KiB')
-            files['health.json'] = current
-        return files
-
-    def reserve(self, job_id, requested, *, bootstrap=False):
-        for _ in range(3):
-            parent, ledger = self.read()
-            if job_id in ledger['reservations']:
-                # A rerun of an interrupted job receives no second allowance.
-                raise BudgetExceeded('job already reserved; use a new run attempt')
-            limit = self.policy['job_bytes'] if bootstrap else self.policy['daily_bytes']
-            used = sum(x['charged_bytes'] for x in ledger['reservations'].values())
-            allocation = min(requested, max(0, limit - used))
-            if allocation <= 0:
-                raise BudgetExceeded('persistent daily byte budget exhausted')
-            runner_limit = self.policy.get('repository_runner_minutes', self.policy['monthly_runner_minutes'])
-            if ledger.get('runner_minutes_used', 0) + 12 > runner_limit:
-                raise BudgetExceeded('persistent monthly runner budget exhausted')
-            ledger['runner_minutes_used'] = ledger.get('runner_minutes_used', 0) + 12
-            ledger['reservations'][job_id] = {'charged_bytes': allocation, 'reserved_bytes': allocation,
-                'status': 'reserved', 'started_at': utcnow(), 'requests': 0, 'reserved_minutes': 12}
-            ledger['history_upper_bound_bytes'] += len(canonical(ledger)) + len(self.health or b'') + 4096
-            try:
-                self.store.publish('control', parent, self.files(ledger), 'chore(data): reserve upstream budget')
-                return allocation
-            except ParentMoved:
-                continue
-        raise ParentMoved('budget reservation contention')
-
-    def settle(self, job_id, actual_bytes, requests, changed_bytes=0, *, bootstrap=False, health=None, runner_seconds=720):
-        for _ in range(3):
-            parent, ledger = self.read()
-            item = ledger['reservations'].get(job_id)
-            if not item:
-                raise ValueError('missing daily reservation')
-            if item['status'] == 'settled':
-                return
-            if actual_bytes > item['reserved_bytes']:
-                raise ValueError('actual transfer exceeds reservation')
-            item.update(charged_bytes=actual_bytes, requests=requests, status='settled', completed_at=utcnow())
-            actual_minutes = min(12, max(1, math.ceil(runner_seconds / 60)))
-            ledger['runner_minutes_used'] -= item.get('reserved_minutes', 12) - actual_minutes
-            item['runner_minutes'] = actual_minutes
-            ledger['history_upper_bound_bytes'] += changed_bytes
-            if not bootstrap:
-                ledger['daily_history'][self.day] = ledger['daily_history'].get(self.day, 0) + changed_bytes
-            # Small control commits also consume all-branch history.
-            ledger['history_upper_bound_bytes'] += len(canonical(ledger)) + len(canonical(health)) + 4096
-            try:
-                self.store.publish('control', parent, self.files(ledger, health), 'chore(data): settle upstream budget')
-                return
-            except ParentMoved:
-                continue
-        raise ParentMoved('budget settlement contention')
-
-    def publication_allowed(self, proposed_bytes, *, bootstrap=False):
-        _, ledger = self.read()
-        history = ledger['history_upper_bound_bytes'] + proposed_bytes
-        daily = list(ledger.get('daily_history', {}).values())
-        estimated_month = (sum(daily) + (0 if bootstrap else proposed_bytes)) / max(1, len(daily)) * 30
-        daily_average = (sum(daily) + (0 if bootstrap else proposed_bytes)) / max(1, len(daily))
-        return (history < self.policy['history_bytes'] and estimated_month < self.policy['monthly_history_growth_bytes']
-                and daily_average <= self.policy['daily_git_change_bytes'])
+from .ledger import Ledger  # Re-export the persistent accounting API.

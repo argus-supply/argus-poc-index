@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "policy_version": "2026-09-09.3",
+  "policy_version": "2026-09-09.4",
   "retention_days": 30,
   "event_days": 30,
   "bootstrap_days": 7,
@@ -23,7 +23,15 @@
     "argus-poc-index": 180,
     "argus-detection-resources": 180
   },
-  "source_order": ["kev", "ghsa", "cve", "official-references", "exploitdb", "poc-in-github", "nuclei"],
+  "source_order": [
+    "kev",
+    "ghsa",
+    "cve",
+    "official-references",
+    "exploitdb",
+    "poc-in-github",
+    "nuclei"
+  ],
   "max_pocs_per_vulnerability": 100,
   "http_timeout_seconds": 25,
   "http_retries": 2,
@@ -37,10 +45,18 @@
   "reference_probe_state_bytes": 65536,
   "reference_recheck_hours": 24,
   "max_source_state_bytes": 524288,
-  "allowed_template_protocols": ["http", "network", "tcp"],
+  "allowed_template_protocols": [
+    "http",
+    "network",
+    "tcp"
+  ],
   "schedules": {
     "argus-intel-data": "17 */2 * * *",
     "argus-poc-index": "37 */6 * * *",
     "argus-detection-resources": "53 */6 * * *"
-  }
+  },
+  "git_cost_metric": "git-object-cost-v1",
+  "git_initialization_accounting": "separate",
+  "git_control_max_bytes": 131072,
+  "git_control_reservation_margin_bytes": 256
 }

@@ -51,6 +51,11 @@ def load_policy(path):
     from .availability import validate_policy
     policy = json.loads(Path(path).read_text())
     validate_policy(policy)
+    if policy.get('git_cost_metric') != 'git-object-cost-v1' or policy.get('git_initialization_accounting') != 'separate':
+        raise ValueError('unsupported Git accounting policy')
+    for key, low, high in (('git_control_max_bytes', 16384, 131072), ('git_control_reservation_margin_bytes', 64, 1024)):
+        if type(policy.get(key)) is not int or not low <= policy[key] <= high:
+            raise ValueError('invalid Git accounting bound: ' + key)
     ceilings = {'max_record_bytes': 16384, 'max_shard_bytes': 524288,
         'max_tree_bytes': 33554432, 'job_seconds': 720, 'job_requests': 500,
         'job_bytes': 67108864, 'daily_bytes': 10485760, 'consumer_daily_bytes': 4194304,

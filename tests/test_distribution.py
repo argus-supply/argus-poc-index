@@ -13,7 +13,7 @@ from sync.core import ROOT, canonical, load_policy, read_snapshot, apply_result,
 from sync.adapters import AdapterResult
 from sync.dependency import consume_intel
 from sync.gitstore import GitStore
-from sync.http import Http
+from sync.http import BudgetExceeded, Http
 from sync.run import run
 
 
@@ -80,6 +80,20 @@ class FixtureHttp(Http):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_partial_git_baseline_does_not_regrant_http_initialization_budget(self):
+        policy = load_policy(ROOT / 'policy.json')
+        states = {source: {'completed_watermark': '2026-09-09T00:00:00Z', 'status': 'partial'}
+                  for source in ('cve', 'ghsa', 'kev')}
+        with tempfile.TemporaryDirectory() as directory, patch('sync.run.GitStore.read', return_value=('a' * 40, {})), \
+                patch('sync.run.read_snapshot', return_value=({}, {}, states, {'created_at': '2026-09-09T00:00:00Z'})), \
+                patch('sync.run.Ledger.initializing', return_value=True), \
+                patch('sync.run.Ledger.reserve', side_effect=BudgetExceeded('probe')) as reserve:
+            result = run('argus-intel-data', str(Path(directory) / 'remote.git'), Path(directory) / 'runner',
+                         'phase', policy=policy)
+        self.assertTrue(result['git_initialization'])
+        self.assertFalse(result['bootstrap'])
+        self.assertFalse(reserve.call_args.kwargs['bootstrap'])
+
     def test_settlement_failure_keeps_data_evidence_and_durable_precharge(self):
         policy = load_policy(ROOT / 'policy.json')
         policy['bootstrap_days'] = policy['retention_days']

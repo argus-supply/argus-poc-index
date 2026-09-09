@@ -8,7 +8,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Record job budget start
         run: echo "ARGUS_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"

@@ -11,6 +11,7 @@ import time
 from .adapters import AdapterResult, collect
 from .core import ROOT, apply_result, build_snapshot, canonical, digest, expire, load_policy, read_snapshot, utcnow
 from .gitstore import GitStore, Ledger, ParentMoved
+from .ledger import CostMigrationRequired
 from .http import BudgetExceeded, Http
 from .dependency import consume_intel
 from .availability import refresh as refresh_reference_availability
@@ -30,11 +31,17 @@ def run(repository, remote, work, job_id, *, policy, token=None, manual=False, h
     registry = json.loads((ROOT / 'sources.json').read_text())
     enabled = [item for item in registry['sources'] if item['repository'].split('/')[-1] == repository]
     enabled.sort(key=lambda item: policy['source_order'].index(item['id']))
-    bootstrap = not previous or any(not sources.get(item['id'], {}).get('completed_watermark') for item in enabled)
     ledger = Ledger(store, policy)
+    try:
+        git_initializing = ledger.initializing()
+        bootstrap = not previous or any(not sources.get(item['id'], {}).get('completed_watermark') for item in enabled)
+    except CostMigrationRequired as error:
+        return {'schema_version': '1.0', 'repository': 'argus-supply/' + repository, 'job_id': job_id,
+            'started_at': now, 'status': 'partial', 'published': False, 'data_commit': parent,
+            'error': str(error), 'git_cost_migration_required': True}
     metrics = {'schema_version': '1.0', 'repository': 'argus-supply/' + repository,
         'job_id': job_id, 'started_at': now, 'status': 'partial', 'data_parent': parent,
-        'bootstrap': bootstrap, 'sources': {}, 'data_commit': parent, 'published': False}
+        'bootstrap': bootstrap, 'git_initialization': git_initializing, 'sources': {}, 'data_commit': parent, 'published': False}
     try:
         reservation = ledger.reserve(job_id, policy['job_bytes'], bootstrap=bootstrap)
     except BudgetExceeded as error:
@@ -45,6 +52,7 @@ def run(repository, remote, work, job_id, *, policy, token=None, manual=False, h
     results, dependencies, dependency = {}, [], None
     dependency_cache, dependency_files = {}, {}
     changed_bytes = 0
+    baseline_complete = False
     try:
         if repository == 'argus-poc-index':
             requested = {state.get('continuation', {}).get('intel_commit_sha') for state in sources.values()
@@ -90,11 +98,18 @@ def run(repository, remote, work, job_id, *, policy, token=None, manual=False, h
             if sum(map(len, files.values())) > policy['max_tree_bytes']:
                 raise ValueError('current data tree including dependency cache exceeds budget')
             changed_bytes = sum(len(value) for key, value in files.items() if before_files.get(key) != value)
-            if not ledger.publication_allowed(changed_bytes, bootstrap=bootstrap):
-                metrics['error'] = 'history ceiling or projected monthly growth: publication paused for review'
-                break
+            baseline_complete = all(sources.get(item['id'], {}).get('status') == 'ok'
+                and sources[item['id']].get('completed_watermark')
+                and not sources[item['id']].get('continuation')
+                and not sources[item['id']].get('coverage_gaps') for item in enabled)
+            candidate, changed = store.prepare('data', parent, files, 'chore(data): synchronize bounded public metadata')
             try:
-                sha, published = store.publish('data', parent, files, 'chore(data): synchronize bounded public metadata')
+                if changed:
+                    metrics['git_cost'] = ledger.reserve_publication(job_id, 'data', candidate, changed_bytes, baseline_complete=baseline_complete)
+                    sha, published = store.push_prepared('data', candidate)
+                else:
+                    sha, published = parent, False
+                    metrics['git_cost'] = {'metric': 'git-object-cost-v1', 'compressed_object_upper_bound_bytes': 0}
                 metrics.update(data_commit=sha, published=published, changed_bytes=changed_bytes,
                     current_tree_bytes=sum(map(len, files.values())), manifest_sha256=digest(files['manifest.json']),
                     record_count=len(records), event_count=len(events), dependencies=dependencies,
@@ -120,12 +135,18 @@ def run(repository, remote, work, job_id, *, policy, token=None, manual=False, h
                 for name, value in sources.items()}}
         try:
             ledger.settle(job_id, client.bytes, client.requests, changed_bytes if metrics['published'] else 0,
-                bootstrap=bootstrap, health=health,
+                bootstrap=bootstrap, health=health, published=metrics['published'],
+                baseline_complete=baseline_complete, baseline_data_commit=metrics['data_commit'],
                 runner_seconds=time.time() - float(os.environ.get('ARGUS_JOB_STARTED_AT', time.time() - (time.monotonic() - started))))
         except Exception as error:
             metrics['status'] = 'partial'
             metrics['settlement_error'] = type(error).__name__
             metrics['reservation_retained'] = True
+        metrics['git_control_cost'] = ledger.control_measurements
+        metrics['git_cost_metric'] = 'git-object-cost-v1'
+        metrics['candidate_full_changed_file_bytes'] = changed_bytes
+        metrics['full_changed_file_bytes'] = changed_bytes if metrics['published'] else 0
+        metrics['baseline_complete'] = baseline_complete
 
 
 def main():
