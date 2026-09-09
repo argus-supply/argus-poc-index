@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "record_id",
+    "kind",
+    "source_id",
+    "native_id",
+    "aliases",
+    "status",
+    "title",
+    "published_at",
+    "source_modified_at",
+    "first_seen_at",
+    "affected",
+    "references",
+    "provenance",
+    "content_hash"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "record_id": {
+      "type": "string",
+      "minLength": 3
+    },
+    "kind": {
+      "enum": [
+        "advisory",
+        "poc",
+        "resource",
+        "continuation"
+      ]
+    },
+    "source_id": {
+      "type": "string"
+    },
+    "native_id": {
+      "type": "string"
+    },
+    "aliases": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "status": {
+      "type": "string"
+    },
+    "title": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "published_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_modified_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "first_seen_at": {
+      "type": "string"
+    },
+    "affected": {
+      "type": "array"
+    },
+    "references": {
+      "type": "array"
+    },
+    "provenance": {
+      "type": "array"
+    },
+    "content_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}

@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "event_id",
+    "record_id",
+    "event_type",
+    "previous_hash",
+    "content_hash",
+    "source_revision",
+    "source_occurred_at",
+    "observed_at",
+    "policy_version"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "event_id": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "record_id": {
+      "type": "string"
+    },
+    "event_type": {
+      "enum": [
+        "disclosure",
+        "kev_added",
+        "kev_removed",
+        "affected_corrected",
+        "score_changed",
+        "withdrawn",
+        "rejected",
+        "poc_added",
+        "poc_changed",
+        "template_added",
+        "template_logic_changed",
+        "template_requirements_changed",
+        "source_deleted",
+        "retention_removed"
+      ]
+    },
+    "previous_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "content_hash": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_revision": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_occurred_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "observed_at": {
+      "type": "string"
+    },
+    "policy_version": {
+      "type": "string"
+    }
+  }
+}

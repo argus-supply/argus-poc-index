@@ -1,0 +1,38 @@
+{
+  "schema_version": "1.0",
+  "policy_version": "2026-09-09.1",
+  "retention_days": 30,
+  "event_days": 30,
+  "bootstrap_days": 7,
+  "overlap_hours": 48,
+  "reconcile_hours": 24,
+  "max_record_bytes": 16384,
+  "max_shard_bytes": 524288,
+  "max_tree_bytes": 33554432,
+  "job_seconds": 720,
+  "job_requests": 500,
+  "job_bytes": 67108864,
+  "daily_bytes": 10485760,
+  "consumer_daily_bytes": 4194304,
+  "daily_git_change_bytes": 1048576,
+  "history_bytes": 134217728,
+  "monthly_history_growth_bytes": 104857600,
+  "monthly_runner_minutes": 900,
+  "runner_minutes_by_repository": {
+    "argus-intel-data": 540,
+    "argus-poc-index": 180,
+    "argus-detection-resources": 180
+  },
+  "max_pocs_per_vulnerability": 100,
+  "http_timeout_seconds": 25,
+  "http_retries": 2,
+  "http_backoff_seconds": 1,
+  "http_retry_after_max_seconds": 30,
+  "max_source_state_bytes": 524288,
+  "allowed_template_protocols": ["http", "network", "tcp"],
+  "schedules": {
+    "argus-intel-data": "17 */2 * * *",
+    "argus-poc-index": "37 */6 * * *",
+    "argus-detection-resources": "53 */6 * * *"
+  }
+}

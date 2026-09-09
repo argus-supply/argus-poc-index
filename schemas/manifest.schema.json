@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "repository",
+    "generation_id",
+    "policy_version",
+    "collector_version",
+    "created_at",
+    "shards",
+    "sources",
+    "retention",
+    "dependencies"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "repository": {
+      "type": "string"
+    },
+    "generation_id": {
+      "type": "string"
+    },
+    "policy_version": {
+      "type": "string"
+    },
+    "collector_version": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": "string"
+    },
+    "shards": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "path",
+          "kind",
+          "count",
+          "bytes",
+          "sha256"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "pattern": "^(records|events)/[a-zA-Z0-9/_.-]+\\.jsonl$"
+          },
+          "kind": {
+            "enum": [
+              "records",
+              "events"
+            ]
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 524288
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "sources": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "status",
+          "coverage_gaps",
+          "errors"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "ok",
+              "partial",
+              "failed",
+              "uninitialized"
+            ]
+          },
+          "revision": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_attempt_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_success_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "completed_watermark": {},
+          "continuation": {},
+          "coverage_gaps": {
+            "type": "array"
+          },
+          "errors": {
+            "type": "array"
+          }
+        }
+      }
+    },
+    "retention": {
+      "type": "object",
+      "required": [
+        "days",
+        "event_days",
+        "event_start_at"
+      ]
+    },
+    "dependencies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "repository",
+          "commit_sha",
+          "manifest_sha256"
+        ],
+        "properties": {
+          "repository": {
+            "type": "string"
+          },
+          "commit_sha": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{40}$"
+          },
+          "manifest_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        }
+      }
+    }
+  }
+}

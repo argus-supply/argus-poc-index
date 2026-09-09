@@ -1,0 +1,45 @@
+[
+  {
+    "schema_version": "1.0",
+    "kind": "advisory",
+    "source_id": "ghsa",
+    "native_id": "GHSA-2345-6789-cfgh",
+    "record_id": "ghsa/GHSA-2345-6789-cfgh",
+    "aliases": [
+      "GHSA-2345-6789-cfgh"
+    ],
+    "status": "active",
+    "title": "Synthetic package configuration advisory",
+    "published_at": "2026-09-08T00:00:00Z",
+    "source_modified_at": "2026-09-08T00:00:00Z",
+    "first_seen_at": "2026-09-09T00:00:00Z",
+    "affected": [
+      {
+        "ecosystem": "npm",
+        "name": "fixture-package",
+        "original_ranges": ">=1.0.0 <1.2.0",
+        "package": {
+          "ecosystem": "npm",
+          "name": "fixture-package"
+        }
+      }
+    ],
+    "references": [
+      {
+        "url": "https://example.com/advisory",
+        "relationship": "upstream-reference"
+      }
+    ],
+    "provenance": [
+      {
+        "source_id": "ghsa",
+        "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ],
+    "content_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "assessment": {
+      "relevance": "unknown",
+      "authentication": null
+    }
+  }
+]
