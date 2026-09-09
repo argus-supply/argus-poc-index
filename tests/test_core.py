@@ -214,6 +214,10 @@ class GitTests(unittest.TestCase):
         self.two = GitStore(self.root / 'two', str(self.remote))
         self.policy = load_policy(ROOT / 'policy.json')
 
+    def test_git_store_disables_background_object_maintenance(self):
+        self.assertEqual(self.one.run('config', '--get', 'gc.auto').stdout.strip(), b'0')
+        self.assertEqual(self.one.run('config', '--get', 'maintenance.auto').stdout.strip(), b'false')
+
     def test_a08_concurrent_parent_is_rejected_and_retry_converges(self):
         sha, _ = self.one.publish('data', None, {'manifest.json': b'old\n'}, 'initial')
         parent, _ = self.two.read('data')

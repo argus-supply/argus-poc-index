@@ -40,10 +40,12 @@ class GitStore:
             self.env.update(GIT_CONFIG_COUNT=str(count + 1))
             self.env['GIT_CONFIG_KEY_' + str(count)] = 'http.proxy'
             self.env['GIT_CONFIG_VALUE_' + str(count)] = proxy
-        count = int(self.env.get('GIT_CONFIG_COUNT', '0'))
-        self.env['GIT_CONFIG_COUNT'] = str(count + 1)
-        self.env['GIT_CONFIG_KEY_' + str(count)] = 'http.version'
-        self.env['GIT_CONFIG_VALUE_' + str(count)] = 'HTTP/1.1'
+        for key, value in (('http.version', 'HTTP/1.1'), ('gc.auto', '0'),
+                           ('maintenance.auto', 'false')):
+            count = int(self.env.get('GIT_CONFIG_COUNT', '0'))
+            self.env['GIT_CONFIG_COUNT'] = str(count + 1)
+            self.env['GIT_CONFIG_KEY_' + str(count)] = key
+            self.env['GIT_CONFIG_VALUE_' + str(count)] = value
         self.remote = remote
         if not (self.path / 'HEAD').exists():
             self.run('init', '--bare')

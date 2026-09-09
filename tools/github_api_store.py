@@ -202,7 +202,9 @@ class GitHubApiStore(GitStore):
         for key in list(self.env):
             if key in ('GH_TOKEN', 'GITHUB_TOKEN', 'GIT_AUTHOR_DATE', 'GIT_COMMITTER_DATE') or key.startswith('GIT_CONFIG_'):
                 self.env.pop(key)
-        self.env.update(TZ='UTC', GIT_NO_LAZY_FETCH='1', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null')
+        self.env.update(TZ='UTC', GIT_NO_LAZY_FETCH='1', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL='/dev/null',
+            GIT_CONFIG_COUNT='2', GIT_CONFIG_KEY_0='gc.auto', GIT_CONFIG_VALUE_0='0',
+            GIT_CONFIG_KEY_1='maintenance.auto', GIT_CONFIG_VALUE_1='false')
 
     def _has(self, sha, kind):
         return self.run('cat-file', '-t', checked_sha(sha), check=False).stdout.strip() == kind.encode()

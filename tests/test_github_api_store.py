@@ -217,6 +217,8 @@ class ApiStoreTests(unittest.TestCase):
         for key in ('author', 'committer'):
             self.assertTrue(payload[key]['date'].endswith('+00:00'))
             self.assertFalse(payload[key]['date'].startswith('2001-'))
+        self.assertEqual(store.run('config', '--get', 'gc.auto').stdout.strip(), b'0')
+        self.assertEqual(store.run('config', '--get', 'maintenance.auto').stdout.strip(), b'false')
 
     def test_changed_blobs_upload_once_and_final_ref_matches_precharged_candidate(self):
         parent = self.api.seed({'shared': b'shared', 'old': b'old'})
