@@ -370,18 +370,10 @@ class Run:
         self.limit = policy.get('adapter_max_units', 400)
 
     def add(self, row):
-        if self.source == 'poc-in-github':
-            old = self.previous_by_id.get(row['record_id'])
-            if old:
-                # A repository can be referenced by several per-CVE files across
-                # different resumed jobs. Do not lose earlier active mappings.
-                active = getattr(self, 'active_poc_aliases', set())
-                aliases = (set(old['aliases']) | set(row['aliases'])) & active
-                row['aliases'] = row['advisory_ids'] = sorted(aliases)
-                if old.get('total_known_count') != row.get('total_known_count'):
-                    row['total_known_count'] = None
-                if old.get('selected_count') != row.get('selected_count'):
-                    row['selected_count'] = None
+        self.check_record(row)
+        self.result.records.append(row)
+
+    def check_record(self, row):
         # Prove the finalized record can fit a lossless bounded physical bundle
         # before advancing its source unit. Core repeats this after final events.
         logical_limit = self.policy.get('max_logical_record_bytes', 262144)
@@ -390,7 +382,6 @@ class Run:
         trial = {**row, 'content_hash': '0' * 64, 'first_seen_at': row.get('first_seen_at') or self.now}
         split_record(trial, max_record_bytes=self.policy.get('max_record_bytes', 16384),
                      max_logical_bytes=logical_limit)
-        self.result.records.append(row)
 
     def unit(self):
         self.units += 1
@@ -703,30 +694,175 @@ class Run:
             self.finish(revision, watermark=self.old.get('completed_watermark'))
             return
         active = sorted({a for x in intel for a in x.get('aliases', []) if CVE.fullmatch(a)})
-        self.active_poc_aliases = set(active)
-        for index in range(self.cursor.get('offset', 0), len(active)):
+        if self.poc_plan(active, revision):
+            # A truncated compare is not a deletion inventory. Publish the
+            # recovery checkpoint before spending a later job on its full scan.
+            return
+        self.poc_working = copy.deepcopy(self.previous_by_id)
+        self.poc_by_alias = {}
+        for key, row in self.poc_working.items():
+            for alias in row['aliases']:
+                self.poc_by_alias.setdefault(alias, set()).add(key)
+        if not self.cursor.get('active_reconciled'):
+            updates = {}
+            for key, old in self.poc_working.items():
+                removed = set(old['aliases']) - set(active)
+                if removed:
+                    row = copy.deepcopy(old)
+                    for alias in sorted(removed):
+                        self.poc_remove_mapping(row, alias, 'outside_active_intel_set', revision, intel_sha)
+                    updates[key] = row
+            self.poc_store(updates)
+            self.cursor['active_reconciled'] = True
+        if self.cursor.get('recovery_reason'):
+            self.result.coverage_gaps = [{'source_id': self.source, 'reason': self.cursor['recovery_reason'],
+                'recovery': 'complete pinned active-set scan pending'}]
+        selected_ids = self.cursor['scan_ids']
+        for index in range(self.cursor.get('offset', 0), len(selected_ids)):
             self.unit()
-            cve = active[index]
+            cve = selected_ids[index]
+            missing = False
             try:
                 raw = self.http.get_json(raw_url(REPOS['poc-in-github'], revision, f'{cve.split("-")[1]}/{cve}.json'))
-            except Exception as exc:
-                if getattr(exc, 'status', None) != 404 and getattr(exc, 'status_code', None) != 404:
+            except FetchError as exc:
+                if exc.status != 404:
                     raise
                 raw = []
+                missing = True
             if not isinstance(raw, list):
                 raise ValueError('invalid per-CVE PoC index')
             unique = {public_url(x['html_url']): x for x in raw}
             selected = sorted(unique)[:self.policy.get('max_pocs_per_vulnerability', 100)]
+            updates = {}
             for url in selected:
                 row = normalize_poc(unique[url], cve, revision, intel_sha)
-                row.update(selected_count=len(selected), total_known_count=len(unique))
-                self.add(row)
+                old = self.poc_working.get(row['record_id'])
+                aliases = set(old['aliases']) if old else set()
+                row['aliases'] = row['advisory_ids'] = sorted(aliases | {cve})
+                if old:
+                    if old.get('mapping_history'):
+                        row['mapping_history'] = copy.deepcopy(old['mapping_history'])
+                    # Preserve earlier URL attribution if the indexed repository
+                    # was renamed; revision-only polls are not new evidence.
+                    row['provenance'] = [item for item in old['provenance'] if item.get('url') != url] + row['provenance']
+                selections = self.poc_selections(old) if old else {}
+                selections[cve] = {'selected_count': len(selected), 'total_known_count': len(unique)}
+                row['selection_by_advisory'] = selections
+                self.poc_counts(row)
+                updates[row['record_id']] = row
+            for key in self.poc_by_alias.get(cve, set()) - set(updates):
+                row = copy.deepcopy(self.poc_working[key])
+                reason = ('source_file_absent' if missing else 'selection_limit' if row['url'] in unique
+                          else 'source_reference_removed')
+                self.poc_remove_mapping(row, cve, reason, revision, intel_sha)
+                updates[key] = row
+            # Validate the entire successful file's reconciliation before any
+            # mapping from that unit is staged or its offset is advanced.
+            self.poc_store(updates)
             self.cursor['offset'] = index + 1
         self.state['intel_commit_sha'] = intel_sha
         self.state['active_ids'] = active
-        # Per-unit prior records are reconciled by their intel aliases; no broad
-        # deletion is inferred from a missing upstream file.
-        self.finish(revision)
+        self.state['last_scan_mode'] = self.cursor['scan_mode']
+        self.result.coverage_gaps = []
+        self.finish(revision, watermark=self.cursor['window_end'])
+
+    def poc_plan(self, active, revision):
+        """Plan only changed/new active CVEs, or a restartable bounded recovery."""
+        if 'scan_ids' in self.cursor:
+            if not isinstance(self.cursor['scan_ids'], list) or not set(self.cursor['scan_ids']).issubset(active):
+                raise ValueError('PoC continuation active-set mismatch')
+            return False
+        self.cursor.setdefault('window_end', self.now)
+        if self.old.get('continuation'):
+            # Previously published offset-only checkpoints enumerated all active
+            # CVEs in this same immutable intel snapshot and sorted order.
+            self.cursor.update(scan_ids=active, scan_mode='full-legacy-resume')
+            return False
+        previous_active = self.old.get('active_ids')
+        if self.old.get('status') != 'ok' or not isinstance(previous_active, list):
+            self.cursor.update(scan_ids=active, scan_mode='full-bootstrap', offset=0)
+            return False
+        if any(not isinstance(identifier, str) or not CVE.fullmatch(identifier) for identifier in previous_active):
+            raise ValueError('invalid saved PoC active inventory')
+        selected = set(active) - set(previous_active)
+        base = self.old.get('revision', '')
+        recovery = None
+        if revision != base:
+            if not SHA.fullmatch(base):
+                recovery = 'previous PoC revision unavailable'
+            else:
+                try:
+                    comparison = self.http.get_json(f'https://api.github.com/repos/{REPOS["poc-in-github"]}/compare/{base}...{revision}?per_page=1')
+                except FetchError as exc:
+                    if exc.status != 404:
+                        raise
+                    comparison = {'status': 'unavailable', 'files': []}
+                if comparison.get('status') not in ('ahead', 'identical'):
+                    recovery = 'PoC upstream comparison history diverged or is unavailable'
+                elif not isinstance(comparison.get('files'), list):
+                    raise ValueError('missing PoC compare file inventory')
+                elif comparison.get('truncated') or len(comparison['files']) >= 300:
+                    recovery = 'PoC compare file inventory truncated at 300'
+                else:
+                    for item in comparison['files']:
+                        for field in ('filename', 'previous_filename'):
+                            if field not in item:
+                                continue
+                            path = checked_path(item[field])
+                            parts = PurePosixPath(path).parts
+                            identifier = PurePosixPath(path).stem
+                            if (len(parts) == 2 and path.endswith('.json') and CVE.fullmatch(identifier)
+                                    and parts[0] == identifier.split('-')[1] and identifier in active):
+                                selected.add(identifier)
+        self.cursor.update(scan_ids=active if recovery else sorted(selected), offset=0,
+            scan_mode='full-recovery' if recovery else 'changed-and-new', base_revision=base)
+        if recovery:
+            self.cursor['recovery_reason'] = recovery
+            self.result.coverage_gaps = [{'source_id': self.source, 'reason': recovery,
+                'recovery': 'complete pinned active-set scan pending'}]
+            return True
+        return False
+
+    def poc_store(self, updates):
+        for row in updates.values():
+            self.check_record(row)
+        for key, row in updates.items():
+            old = self.poc_working.get(key)
+            if old:
+                for alias in old['aliases']:
+                    self.poc_by_alias.get(alias, set()).discard(key)
+            for alias in row['aliases']:
+                self.poc_by_alias.setdefault(alias, set()).add(key)
+            self.poc_working[key] = row
+            self.result.records.append(row)
+
+    @staticmethod
+    def poc_selections(row):
+        if 'selection_by_advisory' in row:
+            return copy.deepcopy(row['selection_by_advisory'])
+        # Legacy multi-CVE records did not retain distinct per-CVE counts.
+        return {alias: {key: row.get(key) if len(row['aliases']) == 1 else None
+                       for key in ('selected_count', 'total_known_count')} for alias in row['aliases']}
+
+    @staticmethod
+    def poc_counts(row):
+        for key in ('selected_count', 'total_known_count'):
+            values = {entry[key] for entry in row['selection_by_advisory'].values()}
+            row[key] = next(iter(values)) if len(values) == 1 else None
+
+    def poc_remove_mapping(self, row, alias, reason, revision, intel_sha):
+        selections = self.poc_selections(row)
+        selections.pop(alias, None)
+        row['selection_by_advisory'] = selections
+        row['aliases'] = row['advisory_ids'] = sorted(set(row['aliases']) - {alias})
+        row.setdefault('mapping_history', {})[alias] = {'reason': reason,
+            'source_revision': revision, 'intel_commit_sha': intel_sha,
+            'source_index_url': raw_url(REPOS['poc-in-github'], revision, f'{alias.split("-")[1]}/{alias}.json')}
+        row.update(index_revision=revision, intel_commit_sha=intel_sha, source_modified_at=None)
+        if not row['aliases']:
+            row['status'] = ('retention_removed' if reason == 'outside_active_intel_set' else
+                             'selection_removed' if reason == 'selection_limit' else 'source_deleted')
+        self.poc_counts(row)
 
     def exploitdb(self):
         intel_sha, intel = self.intel()
@@ -781,6 +917,11 @@ class Run:
 
     def official(self):
         intel_sha, intel = self.intel()
+        if self.old.get('revision') == intel_sha and self.old.get('completed_watermark'):
+            # A completed immutable snapshot also proves that any later cursor
+            # scanning this same SHA is redundant, even if it reports partial.
+            self.finish(intel_sha, watermark=self.old['completed_watermark'])
+            return
         for index in range(self.cursor.get('offset', 0), len(intel)):
             self.unit()
             advisory = intel[index]
@@ -881,12 +1022,12 @@ def collect(source_id, http, previous, *, now, policy, dependency=None):
         code = type(exc).__name__
         detail = str(exc)[:300] if isinstance(exc, (ValueError, FetchError, BudgetExceeded)) else code
         run.result.errors = [{'code': code, 'message': detail, 'http_status': getattr(exc, 'status', None)}]
-        run.result.coverage_gaps = [{'reason': detail, 'source_id': source_id}]
+        run.result.coverage_gaps.append({'reason': detail, 'source_id': source_id})
         run.result.status = 'partial' if run.result.records or run.previous or run.cursor else 'failed'
     unique = {}
     for row in run.result.records:
         key = row['record_id']
-        if key in unique and row['kind'] == 'poc':
+        if key in unique and row['kind'] == 'poc' and row['source_id'] != 'poc-in-github':
             row['aliases'] = sorted(set(row['aliases'] + unique[key]['aliases']))
             row['advisory_ids'] = sorted(set(row['advisory_ids'] + unique[key]['advisory_ids']))
             row['provenance'] = list({canonical(item): item for item in

@@ -122,12 +122,12 @@
       "schema_versions": [
         "PoC-in-GitHub JSON"
       ],
-      "adapter_version": "1.0",
+      "adapter_version": "1.1",
       "cadence_seconds": 21600,
       "bootstrap_method": "Only CVE files belonging to immutable active intel manifest",
-      "incremental_method": "Fixed upstream commit; only applicable per-CVE metadata",
-      "withdrawal_semantics": "Missing index file is absence, temporary request failure is not deletion or invalidity",
-      "recovery_method": "Resume per-CVE offset with original intel and source revisions",
+      "incremental_method": "After completed initialization, compare immutable source base/head and fetch only changed in-scope per-CVE JSON plus newly active intel IDs. Unchanged source and intel SHAs short-circuit after a head check. A same-source new intel snapshot fetches only newly active IDs; inactive mappings expire with provenance.",
+      "withdrawal_semantics": "Successful complete per-CVE files reconcile only that CVE mapping. Preserve original URL/author/provenance and mapping_history; distinguish source_file_absent, source_reference_removed, selection_limit, and outside_active_intel_set. Temporary fetch failures retain mappings and do not claim broken or ineffective PoCs.",
+      "recovery_method": "Resume saved scan_ids/offset at original source and intel commits before newer windows. Comparisons at the 300-file cap, divergent history, or unavailable old SHA publish an explicit partial full-scan checkpoint; only completion of that pinned active-set scan clears the gap. Legacy offset-only checkpoints retain their original sorted active-set traversal.",
       "budgets": {
         "requests_per_job": 300,
         "bytes_per_job": 67108864,

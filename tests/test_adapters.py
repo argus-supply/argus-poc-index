@@ -2,12 +2,19 @@
 import copy
 import hashlib
 import json
+from pathlib import Path
+import subprocess
+import tempfile
 import unittest
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from sync.adapters import (CVE, collect, cve_path, normalize_cve, normalize_ghsa,
+from sync.adapters import (AdapterResult, CVE, Run, collect, cve_path, normalize_cve, normalize_ghsa,
                            normalize_kev, normalize_template, raw_url)
-from sync.http import FetchError
+from sync.core import ROOT, apply_result, build_snapshot, canonical as stored_json, load_policy, read_snapshot
+from sync.gitstore import GitStore
+from sync.http import FetchError, Http
+from sync.run import run as run_collector
 
 REV = 'a' * 40
 OLDER = 'b' * 40
@@ -474,6 +481,212 @@ class SourceContracts(unittest.TestCase):
         self.assertEqual(len(http.urls), 2)
         self.assertEqual(result.state['active_ids'], ['CVE-2020-1234'])
 
+    def poc_baseline(self, indexed, *, policy=None):
+        dep = dependency([normalize_cve(cve(identifier), REV) for identifier in indexed])
+        def handler(url):
+            if '/commits/HEAD' in url:
+                return {'sha': REV}
+            return indexed[url.rsplit('/', 1)[-1][:-5]]
+        result = collect('poc-in-github', HTTP(handler), {}, now=NOW, policy=policy or {}, dependency=dep)
+        self.assertEqual(result.status, 'ok', result.errors)
+        return {'state': result.state, 'records': result.records}, dep
+
+    def poc_reference(self, number=1):
+        return {'id': number, 'html_url': f'https://github.com/example/poc-{number}',
+                'description': 'Public author claim', 'owner': {'login': 'example'}}
+
+    def test_poc_compare_fetches_only_changed_active_cve_and_preserves_other_records(self):
+        indexed = {'CVE-2020-1234': [self.poc_reference(1)], 'CVE-2020-1235': [self.poc_reference(2)],
+                   'CVE-2020-1236': [self.poc_reference(3)]}
+        previous, dep = self.poc_baseline(indexed)
+        def handler(url):
+            if '/commits/HEAD' in url:
+                return {'sha': OLDER}
+            if '/compare/' in url:
+                self.assertIn(REV + '...' + OLDER, url)
+                return {'status': 'ahead', 'files': [
+                    {'filename': '2020/CVE-2020-1235.json'}, {'filename': 'README.md'},
+                    {'filename': '2020/CVE-2020-9999.json'}, {'filename': 'unrelated/CVE-2020-1234.json'}]}
+            self.assertTrue(url.endswith('/2020/CVE-2020-1235.json'))
+            return [{**self.poc_reference(2), 'description': 'Revised public claim'}]
+        http = HTTP(handler)
+        result = collect('poc-in-github', http, previous, now=NOW, policy={}, dependency=dep)
+        self.assertEqual(result.status, 'ok')
+        self.assertEqual([row['native_id'] for row in result.records], ['2'])
+        self.assertEqual(result.state['last_scan_mode'], 'changed-and-new')
+        self.assertEqual(len(http.urls), 3)
+
+    def test_poc_same_source_new_active_id_only_fetches_the_new_file(self):
+        previous, dep = self.poc_baseline({'CVE-2020-1234': [self.poc_reference()]})
+        dep['commit_sha'] = OLDER
+        dep['records'].append(normalize_cve(cve('CVE-2020-1235'), REV))
+        def handler(url):
+            if '/commits/HEAD' in url:
+                return {'sha': REV}
+            self.assertTrue(url.endswith('/2020/CVE-2020-1235.json'))
+            return [self.poc_reference(2)]
+        http = HTTP(handler)
+        result = collect('poc-in-github', http, previous, now=NOW, policy={}, dependency=dep)
+        self.assertEqual(result.status, 'ok')
+        self.assertEqual([row['native_id'] for row in result.records], ['2'])
+        self.assertEqual(len(http.urls), 2)
+
+    def test_poc_changed_and_new_union_resumes_without_recomparing_or_changing_pins(self):
+        previous, dep = self.poc_baseline({'CVE-2020-1234': [self.poc_reference(1)],
+                                          'CVE-2020-1235': [self.poc_reference(2)]})
+        dep['commit_sha'] = OLDER
+        dep['records'].append(normalize_cve(cve('CVE-2020-1236'), REV))
+        def handler(url):
+            if '/commits/HEAD' in url:
+                return {'sha': OLDER}
+            if '/compare/' in url:
+                return {'status': 'ahead', 'files': [{'filename': '2020/CVE-2020-1235.json'}]}
+            self.assertIn('/' + OLDER + '/', url)
+            return [self.poc_reference(2 if url.endswith('1235.json') else 3)]
+        http = HTTP(handler)
+        first = collect('poc-in-github', http, previous, now=NOW, policy={'adapter_max_units': 1}, dependency=dep)
+        self.assertEqual(first.status, 'partial')
+        self.assertEqual(first.continuation['scan_ids'], ['CVE-2020-1235', 'CVE-2020-1236'])
+        self.assertEqual(first.continuation['offset'], 1)
+        merged = {row['record_id']: row for row in previous['records'] + first.records}
+        resumed_http = HTTP(lambda url: [self.poc_reference(3)] if url.endswith('/2020/CVE-2020-1236.json')
+                            else self.fail('resume resolved a newer source or repeated compare'))
+        final = collect('poc-in-github', resumed_http, {'state': first.state, 'records': list(merged.values())},
+            now='2026-09-10T00:00:00Z', policy={}, dependency=dep)
+        self.assertEqual(final.status, 'ok')
+        self.assertEqual(final.completed_watermark, NOW)
+        self.assertEqual(final.state['intel_commit_sha'], OLDER)
+        self.assertEqual(len(resumed_http.urls), 1)
+
+    def test_poc_removed_file_invalidates_only_its_mapping_and_keeps_reference_provenance(self):
+        reference = self.poc_reference()
+        previous, dep = self.poc_baseline({'CVE-2020-1234': [reference], 'CVE-2020-1235': [reference]})
+        def handler(url):
+            if '/commits/HEAD' in url:
+                return {'sha': OLDER}
+            if '/compare/' in url:
+                return {'status': 'ahead', 'files': [{'filename': '2020/CVE-2020-1235.json', 'status': 'removed'}]}
+            raise FetchError('upstream HTTP 404', status=404)
+        result = collect('poc-in-github', HTTP(handler), previous, now=NOW, policy={}, dependency=dep)
+        self.assertEqual(result.status, 'ok')
+        row = result.records[0]
+        self.assertEqual(row['aliases'], ['CVE-2020-1234'])
+        self.assertEqual(row['status'], 'active')
+        self.assertEqual(row['url'], reference['html_url'])
+        self.assertEqual(row['author'], 'example')
+        self.assertEqual(row['provenance'], previous['records'][0]['provenance'])
+        self.assertEqual(row['mapping_history']['CVE-2020-1235']['reason'], 'source_file_absent')
+        self.assertEqual(row['availability'], 'not-checked')
+
+    def test_poc_successful_empty_file_is_source_removal_not_temporary_link_failure(self):
+        previous, dep = self.poc_baseline({'CVE-2020-1234': [self.poc_reference()]})
+        def handler(url):
+            if '/commits/HEAD' in url:
+                return {'sha': OLDER}
+            if '/compare/' in url:
+                return {'status': 'ahead', 'files': [{'filename': '2020/CVE-2020-1234.json'}]}
+            return []
+        result = collect('poc-in-github', HTTP(handler), previous, now=NOW, policy={}, dependency=dep)
+        row = result.records[0]
+        self.assertEqual(row['status'], 'source_deleted')
+        self.assertEqual(row['advisory_ids'], [])
+        self.assertEqual(row['mapping_history']['CVE-2020-1234']['reason'], 'source_reference_removed')
+        self.assertEqual(row['availability'], 'not-checked')
+
+    def test_poc_temporary_fetch_failure_preserves_old_mapping_and_unit_offset(self):
+        previous, dep = self.poc_baseline({'CVE-2020-1234': [self.poc_reference()]})
+        before = copy.deepcopy(previous)
+        def handler(url):
+            if '/commits/HEAD' in url:
+                return {'sha': OLDER}
+            if '/compare/' in url:
+                return {'status': 'ahead', 'files': [{'filename': '2020/CVE-2020-1234.json'}]}
+            raise FetchError('upstream HTTP 503; retries exhausted', status=503)
+        result = collect('poc-in-github', HTTP(handler), previous, now=NOW, policy={}, dependency=dep)
+        self.assertEqual(result.status, 'partial')
+        self.assertEqual(result.records, [])
+        self.assertEqual(result.continuation['offset'], 0)
+        self.assertEqual(previous, before)
+
+    def test_truncated_poc_compare_persists_full_scan_then_resumes_until_complete(self):
+        indexed = {'CVE-2020-1234': [self.poc_reference(1)], 'CVE-2020-1235': [self.poc_reference(2)]}
+        previous, dep = self.poc_baseline(indexed)
+        def handler(url):
+            if '/commits/HEAD' in url:
+                return {'sha': OLDER}
+            if '/compare/' in url:
+                return {'status': 'ahead', 'files': [{'filename': '2020/CVE-2020-1234.json'}] * 300}
+            self.fail('truncated enumeration must first publish a recovery checkpoint')
+        first = collect('poc-in-github', HTTP(handler), previous, now=NOW, policy={}, dependency=dep)
+        self.assertEqual(first.status, 'partial')
+        self.assertEqual(first.records, [])
+        self.assertEqual(first.continuation['scan_ids'], sorted(indexed))
+        self.assertIn('truncated', first.coverage_gaps[0]['reason'])
+        http = HTTP(lambda url: indexed[url.rsplit('/', 1)[-1][:-5]])
+        second = collect('poc-in-github', http, {'state': first.state, 'records': previous['records']},
+            now=NOW, policy={'adapter_max_units': 1}, dependency=dep)
+        self.assertEqual(second.status, 'partial')
+        self.assertEqual(second.continuation['offset'], 1)
+        self.assertIn('truncated', second.coverage_gaps[0]['reason'])
+        merged = {row['record_id']: row for row in previous['records'] + second.records}
+        final = collect('poc-in-github', http, {'state': second.state, 'records': list(merged.values())},
+            now=NOW, policy={}, dependency=dep)
+        self.assertEqual(final.status, 'ok')
+        self.assertEqual(final.coverage_gaps, [])
+        self.assertEqual(final.state['active_ids'], sorted(indexed))
+        self.assertEqual(final.state['last_scan_mode'], 'full-recovery')
+        self.assertEqual(len(http.urls), 2)
+
+    def test_poc_inactive_intel_mapping_expires_without_refetching_unchanged_files(self):
+        previous, dep = self.poc_baseline({'CVE-2020-1234': [self.poc_reference(1)],
+                                          'CVE-2020-1235': [self.poc_reference(2)]})
+        dep['commit_sha'] = OLDER
+        dep['records'] = dep['records'][1:]
+        http = HTTP(lambda url: {'sha': REV} if '/commits/HEAD' in url else self.fail('unchanged file refetched'))
+        result = collect('poc-in-github', http, previous, now=NOW, policy={}, dependency=dep)
+        self.assertEqual(result.status, 'ok')
+        self.assertEqual(len(result.records), 1)
+        self.assertEqual(result.records[0]['status'], 'retention_removed')
+        self.assertEqual(result.records[0]['mapping_history']['CVE-2020-1234']['reason'], 'outside_active_intel_set')
+        self.assertEqual(len(http.urls), 1)
+
+    def test_poc_selection_limit_removal_does_not_claim_upstream_reference_was_deleted(self):
+        previous, dep = self.poc_baseline({'CVE-2020-1234': [self.poc_reference(2)]})
+        def handler(url):
+            if '/commits/HEAD' in url:
+                return {'sha': OLDER}
+            if '/compare/' in url:
+                return {'status': 'ahead', 'files': [{'filename': '2020/CVE-2020-1234.json'}]}
+            return [self.poc_reference(1), self.poc_reference(2)]
+        result = collect('poc-in-github', HTTP(handler), previous, now=NOW,
+                         policy={'max_pocs_per_vulnerability': 1}, dependency=dep)
+        rows = {row['native_id']: row for row in result.records}
+        self.assertEqual(result.status, 'ok')
+        self.assertEqual(rows['1']['selected_count'], 1)
+        self.assertEqual(rows['1']['total_known_count'], 2)
+        self.assertEqual(rows['2']['status'], 'selection_removed')
+        self.assertEqual(rows['2']['mapping_history']['CVE-2020-1234']['reason'], 'selection_limit')
+
+    def test_poc_renamed_index_moves_mapping_without_reviving_the_old_alias(self):
+        previous, dep = self.poc_baseline({'CVE-2020-1234': [self.poc_reference()]})
+        dep['commit_sha'] = OLDER
+        dep['records'].append(normalize_cve(cve('CVE-2020-1235'), REV))
+        def handler(url):
+            if '/commits/HEAD' in url:
+                return {'sha': OLDER}
+            if '/compare/' in url:
+                return {'status': 'ahead', 'files': [{'filename': '2020/CVE-2020-1235.json',
+                    'previous_filename': '2020/CVE-2020-1234.json', 'status': 'renamed'}]}
+            if url.endswith('1234.json'):
+                raise FetchError('upstream HTTP 404', status=404)
+            return [self.poc_reference()]
+        result = collect('poc-in-github', HTTP(handler), previous, now=NOW, policy={}, dependency=dep)
+        self.assertEqual(result.status, 'ok')
+        self.assertEqual(len(result.records), 1)
+        self.assertEqual(result.records[0]['status'], 'active')
+        self.assertEqual(result.records[0]['aliases'], ['CVE-2020-1235'])
+        self.assertEqual(result.records[0]['mapping_history']['CVE-2020-1234']['reason'], 'source_file_absent')
+
     def test_exploitdb_retains_recent_non_cve_reference_without_invented_link(self):
         csv_data = b'id,description,codes,date_published\n1,Recent reference,,2026-09-08\n2,Old irrelevant,,2000-01-01\n'
         http = HTTP(lambda u: [{'id': REV}] if '/commits?' in u else csv_data)
@@ -491,6 +704,29 @@ class SourceContracts(unittest.TestCase):
         self.assertEqual(result.records[0]['intel_commit_sha'], REV)
         origins = [x['reference']['assertion_role'] for x in result.records[0]['provenance'] if 'reference' in x]
         self.assertEqual(origins, ['cna', 'adp'])
+
+    def test_official_completed_same_sha_clears_redundant_partial_cursor_without_units(self):
+        previous = {'state': {'status': 'partial', 'revision': REV, 'completed_watermark': NOW,
+            'last_success_at': NOW, 'continuation': {'intel_commit_sha': REV, 'offset': 400},
+            'coverage_gaps': [{'reason': 'adapter_unit_budget_exhausted'}]}}
+        before = copy.deepcopy(previous)
+        with patch.object(Run, 'unit', side_effect=AssertionError('completed snapshot rescanned')):
+            result = collect('official-references', HTTP(lambda url: self.fail('unexpected fetch')), previous,
+                now='2026-09-09T02:00:00Z', policy={}, dependency=dependency([normalize_cve(cve(), REV)]))
+        self.assertEqual(result.status, 'ok')
+        self.assertEqual(result.records, [])
+        self.assertIsNone(result.continuation)
+        self.assertEqual(result.coverage_gaps, [])
+        self.assertEqual(result.completed_watermark, NOW)
+        self.assertEqual(previous, before)
+
+    def test_official_same_sha_without_completion_proof_still_resumes(self):
+        previous = {'state': {'status': 'partial', 'revision': REV,
+            'continuation': {'intel_commit_sha': REV, 'offset': 0}}}
+        result = collect('official-references', HTTP(lambda url: self.fail('unexpected fetch')), previous,
+            now=NOW, policy={}, dependency=dependency([normalize_cve(cve(), REV)]))
+        self.assertEqual(result.status, 'ok')
+        self.assertEqual(len(result.records), 1)
 
     def template(self, extra=''):
         return ('id: widget-panel\ninfo:\n  name: Widget panel\n  tags: panel,auth\n  metadata:\n    product: widget\n'
@@ -601,6 +837,103 @@ class SourceContracts(unittest.TestCase):
         result = collect('nuclei', HTTP(handler), {}, now=NOW, policy={})
         self.assertEqual(result.status, 'ok')
         self.assertFalse(result.records[0]['verification']['executed'])
+
+
+class OfficialReferenceRunnerTests(unittest.TestCase):
+    def test_fresh_runners_finish_once_then_do_zero_reference_units_and_data_rewrites(self):
+        policy = load_policy(ROOT / 'policy.json')
+        policy['adapter_max_units'] = 2
+        rows = []
+        for suffix in ('2222', '2223', '2224', '2225', '2226'):
+            row = normalize_ghsa(ghsa('GHSA-2345-6789-' + suffix))
+            row['references'] = [{'url': 'https://example.com/advisory/' + suffix,
+                                  'relationship': 'upstream-reference'}]
+            rows.append(row)
+        records, events, sources = {}, {}, {}
+        apply_result(records, events, sources, 'ghsa', AdapterResult(records=rows, status='ok', revision=REV),
+                     NOW, policy)
+        intel_files, _ = build_snapshot('argus-supply/argus-intel-data', records, events, sources,
+                                       policy, NOW, 'fixture')
+
+        class PublicFixtureHttp(Http):
+            """Substitute external responses only; runner, state and Git are real."""
+            def __init__(self, dependency_sha):
+                super().__init__(policy)
+                self.dependency_sha = dependency_sha
+
+            def fork(self, **kwargs):
+                return self
+
+            def get_json(self, url, headers=None):
+                self._before()
+                if url == 'https://api.github.com/repos/argus-supply/argus-intel-data/git/ref/heads/data':
+                    response = {'object': {'sha': self.dependency_sha}}
+                elif url == 'https://api.github.com/repos/nomi-sec/PoC-in-GitHub/commits/HEAD':
+                    response = {'sha': REV}
+                elif url == 'https://gitlab.com/api/v4/projects/exploit-database%2Fexploitdb/repository/commits?per_page=1':
+                    response = [{'id': REV}]
+                else:
+                    raise AssertionError('unexpected fixture URL: ' + url)
+                self._charge(len(stored_json(response)))
+                return response
+
+            def get_bytes(self, url, headers=None):
+                self._before()
+                prefix = 'https://raw.githubusercontent.com/argus-supply/argus-intel-data/' + self.dependency_sha + '/'
+                if url.startswith(prefix):
+                    response = intel_files[url[len(prefix):]]
+                elif url == 'https://gitlab.com/api/v4/projects/exploit-database%2Fexploitdb/repository/files/files_exploits.csv/raw?ref=' + REV:
+                    response = b'id,description,codes,date_published\n'
+                else:
+                    raise AssertionError('unexpected fixture URL: ' + url)
+                self._charge(len(response))
+                return response
+
+        units = []
+        original_unit = Run.unit
+        def count_unit(adapter):
+            if adapter.source == 'official-references':
+                units[-1] += 1
+            return original_unit(adapter)
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(Run, 'unit', count_unit):
+            root = Path(directory)
+            remote = root / 'remote.git'
+            subprocess.run(['git', 'init', '--bare', str(remote)], check=True, capture_output=True)
+            attempts = []
+            for index in range(5):
+                units.append(0)
+                with patch('sync.run.utcnow', return_value=f'2026-09-09T0{index}:00:00Z'):
+                    result = run_collector('argus-poc-index', str(remote), root / f'runner-{index}',
+                        f'job-{index}', policy=policy, http=PublicFixtureHttp(REV))
+                attempts.append(result)
+            self.assertEqual([result['status'] for result in attempts], ['partial', 'partial', 'ok', 'ok', 'ok'])
+            self.assertEqual(units, [3, 3, 1, 0, 0])
+            completed_commit = attempts[2]['data_commit']
+            for result in attempts[3:]:
+                self.assertEqual(result['data_commit'], completed_commit)
+                self.assertFalse(result['published'])
+                self.assertEqual(result['changed_bytes'], 0)
+            _, files = GitStore(root / 'consumer', str(remote)).read('data')
+            final_records, final_events, final_sources, _ = read_snapshot(files)
+            self.assertEqual(len(final_records), 5)
+            self.assertEqual(len(final_events), 5)
+            self.assertEqual(final_sources['official-references']['completed_watermark'], '2026-09-09T02:00:00Z')
+            self.assertTrue(all(row['provenance'][-1]['reference']['relationship'] == 'upstream-reference'
+                                for row in final_records.values()))
+
+            units.append(0)
+            with patch('sync.run.utcnow', return_value='2026-09-09T05:00:00Z'):
+                changed = run_collector('argus-poc-index', str(remote), root / 'runner-new-sha',
+                    'job-new-sha', policy=policy, http=PublicFixtureHttp(OLDER))
+            self.assertEqual(changed['status'], 'partial')
+            self.assertEqual(units[-1], 3)
+            _, changed_files = GitStore(root / 'changed-consumer', str(remote)).read('data')
+            _, _, changed_sources, _ = read_snapshot(changed_files)
+            state = changed_sources['official-references']
+            self.assertEqual(state['continuation']['intel_commit_sha'], OLDER)
+            self.assertEqual(state['continuation']['offset'], 2)
+            self.assertEqual(state['completed_watermark'], '2026-09-09T02:00:00Z')
 
 
 if __name__ == '__main__':
