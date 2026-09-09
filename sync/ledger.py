@@ -81,7 +81,9 @@ class Ledger:
                     if not intent:
                         raise CostMigrationRequired('unaccounted ' + branch + ' publication; audit before collection')
                     cost['accounted_refs'][ref] = actual
-                    if branch == 'data' and intent.get('baseline_complete') and cost['baseline_completed_at'] is None:
+                    if (branch == 'data' and intent.get('baseline_complete') and intent.get('baseline_gate_version', 1) >= 2
+                            and intent.get('candidate') not in cost.get('invalidated_baseline_candidates', [])
+                            and cost['baseline_completed_at'] is None):
                         cost['baseline_completed_at'] = intent['reserved_at']
             cost['steady_daily_bytes'] = {day: value for day, value in cost['steady_daily_bytes'].items()
                                            if day.startswith(self.day[:7])}
@@ -184,7 +186,8 @@ class Ledger:
                 continue
         raise ParentMoved('budget reservation contention')
 
-    def reserve_publication(self, job_id, branch, candidate, full_changed_bytes, *, baseline_complete=False):
+    def reserve_publication(self, job_id, branch, candidate, full_changed_bytes, *, baseline_complete=False,
+                            baseline_gate_version=2, dependency_coverage=None):
         from .gitstore import ParentMoved
         for _ in range(3):
             parent, ledger = self.read()
@@ -193,13 +196,15 @@ class Ledger:
                 raise BudgetExceeded('publication already reserved for this job')
             tips = self.store.observe_heads()
             measured = measure_increment(self.store.path, candidate, tips, baseline_complete=True)
+            self.validate_baseline_proof(baseline_complete, baseline_gate_version, dependency_coverage)
             amount = measured['compressed_object_upper_bound_bytes']
             self.charge(ledger['git_cost'], amount, item['initialization'], item['day'])
             item['git_publication'] = {'branch': branch, 'candidate': candidate,
                 'parent': tips.get('refs/heads/' + branch), 'compressed_upper_bound_bytes': amount,
                 'full_changed_file_bytes': full_changed_bytes, 'measurement': measured,
                 'state': 'reserved', 'baseline_complete': bool(baseline_complete and branch == 'data'),
-                'reserved_at': utcnow()}
+                'reserved_at': utcnow(), 'baseline_gate_version': baseline_gate_version,
+                'dependency_coverage': dependency_coverage}
             phase = 'initialization' if item['initialization'] else 'steady'
             ledger['git_cost']['full_changed_file_bytes'][phase] += full_changed_bytes
             try:
@@ -210,7 +215,8 @@ class Ledger:
         raise ParentMoved('publication reservation contention')
 
     def settle(self, job_id, actual_bytes, requests, changed_bytes=0, *, bootstrap=False,
-               health=None, runner_seconds=720, published=False, baseline_complete=False, baseline_data_commit=None):
+               health=None, runner_seconds=720, published=False, baseline_complete=False, baseline_data_commit=None,
+               baseline_gate_version=2, dependency_coverage=None):
         from .gitstore import ParentMoved
         for _ in range(3):
             parent, ledger = self.read()
@@ -238,11 +244,12 @@ class Ledger:
                 ledger['runner_minutes_used'] -= item['reserved_minutes'] - actual_minutes
             item['runner_minutes'] = actual_minutes
             # A recovery must not start a second initialization exemption.
+            self.validate_baseline_proof(baseline_complete, baseline_gate_version, dependency_coverage)
             data_tip = self.store.observe_heads().get('refs/heads/data')
             proven_publication = bool(published and intent and intent['branch'] == 'data' and intent['state'] == 'committed')
             proven_noop = bool(baseline_data_commit and data_tip == baseline_data_commit
                 and ledger['git_cost']['accounted_refs'].get('refs/heads/data') == baseline_data_commit)
-            if baseline_complete and (proven_publication or proven_noop) and item['status'] == 'settled' and ledger['git_cost']['baseline_completed_at'] is None:
+            if baseline_complete and baseline_gate_version >= 2 and (proven_publication or proven_noop) and item['status'] == 'settled' and ledger['git_cost']['baseline_completed_at'] is None:
                 ledger['git_cost']['baseline_completed_at'] = utcnow()
             try:
                 self.write(parent, ledger, 'chore(data): settle measured work', initialization=item['initialization'], health=health)
@@ -250,6 +257,71 @@ class Ledger:
             except ParentMoved:
                 continue
         raise ParentMoved('budget settlement contention')
+
+    @staticmethod
+    def validate_baseline_proof(complete, version, coverage):
+        if type(version) is not int or version != 2:
+            raise ValueError('unsupported baseline gate version')
+        if complete and coverage is not None:
+            if not isinstance(coverage, dict) or not coverage or any(
+                    not isinstance(proof, dict) or proof.get('coverage_complete') is not True
+                    for proof in coverage.values()):
+                raise ValueError('complete baseline requires complete pinned dependencies')
+
+    def correct_incomplete_dependency_baseline(self, expected_data_sha, proofs):
+        """Append an evidence-bound correction without refunding any incurred cost.
+
+        Only a published PoC baseline referencing an incomplete fixed intel
+        manifest qualifies. Historical success and the old marker remain in the
+        correction record; even prior steady charges are conservatively retained.
+        """
+        from .core import validate
+        parent, ledger = self.read()
+        sha, files = self.store.read('data')
+        if sha != expected_data_sha:
+            raise CostMigrationRequired('data changed before baseline correction')
+        manifest = json.loads(files['manifest.json'])
+        if manifest['repository'] != 'argus-supply/argus-poc-index':
+            raise ValueError('dependency baseline correction is scoped to PoC')
+        dependencies = {item['repository']: item for item in manifest.get('dependencies', [])}
+        evidence = []
+        for proof in proofs:
+            if proof.get('repository') != 'argus-supply/argus-intel-data':
+                raise ValueError('baseline correction requires the configured intel dependency')
+            dependency = dependencies.get(proof['repository'])
+            body = proof['manifest_bytes']
+            if (not dependency or dependency['commit_sha'] != proof['commit_sha']
+                    or hashlib.sha256(body).hexdigest() != dependency['manifest_sha256']):
+                raise ValueError('baseline correction dependency proof mismatch')
+            source_manifest = json.loads(body)
+            validate('manifest', source_manifest)
+            if source_manifest['repository'] != proof['repository']:
+                raise ValueError('dependency proof belongs to another repository')
+            states = source_manifest['sources']
+            complete = all(states.get(name, {}).get('status') == 'ok'
+                and states[name].get('completed_watermark') and not states[name].get('continuation')
+                and not states[name].get('coverage_gaps') and not states[name].get('errors')
+                for name in ('cve', 'ghsa', 'kev'))
+            if not complete:
+                evidence.append({**dependency, 'coverage_complete': False})
+        if not evidence:
+            raise ValueError('no incomplete pinned dependency was proven')
+        cost = ledger['git_cost']
+        if not cost['baseline_completed_at']:
+            raise ValueError('no completed baseline marker to correct')
+        if len(cost.get('baseline_corrections', [])) >= 4:
+            raise ValueError('bounded baseline correction history exhausted')
+        before = cost['accounted_upper_bound_bytes']
+        correction = {'at': utcnow(), 'data_commit': sha, 'invalidated_completed_at': cost['baseline_completed_at'],
+            'replacement_completed_at': None, 'gate_version': 2, 'dependencies': evidence,
+            'reason': 'own-source success was incorrectly treated as full baseline despite incomplete pinned intel',
+            'accounted_bytes_before': before, 'cost_refund_bytes': 0,
+            'prior_steady_charges_retained': copy.deepcopy(cost['steady_daily_bytes'])}
+        cost.setdefault('baseline_corrections', []).append(correction)
+        cost.setdefault('invalidated_baseline_candidates', []).append(sha)
+        cost['baseline_completed_at'] = None
+        result = self.write(parent, ledger, 'fix(data): correct incomplete dependency baseline claim', initialization=True)
+        return {'control_sha': result, 'correction': correction, 'control_measurements': self.control_measurements}
 
     def publication_allowed(self, proposed_bytes, *, bootstrap=False):
         _, ledger = self.read()

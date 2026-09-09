@@ -10,4 +10,4 @@ The control branch reserves daily HTTP bytes before upstream access and measured
 
 Baseline collection starts with seven days and remains partial until 30-day coverage is established. Requests, wire bytes, record/shard/tree size and history growth are bounded by `policy.json`. Cron enabled: true. Runtime acceptance, real schedules and 24-hour costs are recorded separately in the ARGUS implementation report.
 
-Generated code provenance: `788313b4dc24f847f93bdf5f7d9a3fe43e70467c`. Verify with `python tools/check_distribution.py`; edit the application source and regenerate.
+Generated code provenance: `5607bb59fa8320263b37465b69fa7a6607c25d7f`. Verify with `python tools/check_distribution.py`; edit the application source and regenerate.

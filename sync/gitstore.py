@@ -26,9 +26,10 @@ class GitStore:
     def __init__(self, path, remote, token=None):
         self.path = Path(path)
         self.path.mkdir(parents=True, exist_ok=True)
-        self.env = dict(os.environ, GIT_TERMINAL_PROMPT='0', GIT_TRACE='0', GIT_TRACE_CURL='0', GIT_CURL_VERBOSE='0',
+        self.env = dict(os.environ, GIT_TERMINAL_PROMPT='0', GIT_TRACE='0', GIT_TRACE_CURL='0',
             GIT_AUTHOR_NAME='ARGUS data sync', GIT_AUTHOR_EMAIL='sync@argus.invalid',
             GIT_COMMITTER_NAME='ARGUS data sync', GIT_COMMITTER_EMAIL='sync@argus.invalid')
+        self.env.pop('GIT_CURL_VERBOSE', None)
         if token:
             credential = base64.b64encode(('x-access-token:' + token).encode()).decode()
             self.env.update(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='http.https://github.com/.extraheader',

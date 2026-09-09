@@ -29,6 +29,7 @@ SHA = re.compile(r'[0-9a-f]{40}')
 REPOS = {'cve': 'CVEProject/cvelistV5', 'ghsa': 'github/advisory-database',
          'kev': 'cisagov/kev-data', 'poc-in-github': 'nomi-sec/PoC-in-GitHub',
          'nuclei': 'projectdiscovery/nuclei-templates'}
+NUCLEI_AUXILIARY = 'http/technologies/wappalyzer-mapping.yml'
 
 
 @dataclass
@@ -327,6 +328,25 @@ def normalize_template(data, path, revision, blob_sha, *, max_bytes=2 * 1024 * 1
     return row
 
 
+def normalize_nuclei_auxiliary(data, path, revision, blob_sha):
+    """Record the known automatic-scan mapping without inventing a template ID."""
+    if path != NUCLEI_AUXILIARY or len(data) > 65536:
+        raise ValueError('unknown or oversized Nuclei auxiliary metadata')
+    actual_blob = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+    if actual_blob != blob_sha:
+        raise ValueError('Nuclei auxiliary blob hash mismatch')
+    mapping = yaml.load(data, Loader=MetadataLoader)
+    template_keys = {'id', 'info', 'http', 'requests', 'network', 'tcp', 'headless', 'code', 'file', 'dns', 'ssl', 'javascript'}
+    if (not isinstance(mapping, dict) or template_keys.intersection(mapping)
+            or any(not isinstance(key, str) or not key.strip() or not isinstance(value, str) or not value.strip()
+                   for key, value in mapping.items())):
+        raise ValueError('invalid Nuclei automatic-scan technology/tag mapping')
+    return {'classification': 'automatic-scan-technology-tags', 'source_commit': revision,
+        'path': path, 'blob_sha': blob_sha, 'sha256': hashlib.sha256(data).hexdigest(),
+        'bytes': len(data), 'mapping': mapping,
+        'role': 'engine auxiliary configuration; not a detection template', 'executed': False}
+
+
 def delta_ids(raw, lower, upper):
     if not isinstance(raw, list) or not raw:
         raise ValueError('empty or invalid CVE delta log')
@@ -495,16 +515,15 @@ class Run:
         except FetchError as exc:
             if exc.status == 404:
                 if row['status'] != 'rejected':
-                    raise ValueError(f'bootstrap old-record comparison unknown:{row["native_id"]}') from None
-                # A rejected identifier need never have had a publication date.
-                # Confirmed absence at the pinned baseline proves this explicit
-                # rejection was added within the interval, without a disclosure.
-                old = {'status': 'absent', 'affected': row['affected'], 'assertions': row['assertions']}
+                    old, baseline, cutoff = self.cve_window_baseline(row, revision, cutoff)
+                else:
+                    # A rejected identifier need never have had a publication date.
+                    # Confirmed absence at the pinned baseline proves this explicit
+                    # rejection was added within the interval, without a disclosure.
+                    old = {'status': 'absent', 'affected': row['affected'], 'assertions': row['assertions']}
             else:
                 raise
-        changed = [key for key in ('affected', 'status') if old[key] != row[key]]
-        if [x['metrics'] for x in old['assertions'] if x.get('metrics')] != [x['metrics'] for x in row['assertions'] if x.get('metrics')]:
-            changed.append('scores')
+        changed = self.cve_material_fields(old, row)
         if not changed:
             self.state['bootstrap_old_records_without_material_change'] = self.state.get('bootstrap_old_records_without_material_change', 0) + 1
             return
@@ -513,6 +532,58 @@ class Run:
             'changed_fields': changed, 'before_status': old['status'],
             'timing': 'observed-state-difference-within-interval'}
         self.add(row)
+        self.cursor.pop('material_history', None)
+
+    @staticmethod
+    def cve_material_fields(old, row):
+        changed = [key for key in ('affected', 'status') if old[key] != row[key]]
+        if [x['metrics'] for x in old['assertions'] if x.get('metrics')] != [x['metrics'] for x in row['assertions'] if x.get('metrics')]:
+            changed.append('scores')
+        return changed
+
+    def cve_window_baseline(self, row, revision, cutoff):
+        """Prove a change after a late source import, never infer one from 404.
+
+        A global snapshot can predate a CVE published just before the retention
+        boundary. A differing immutable file snapshot inside the window proves
+        a narrower interval; it does not change the original publication date.
+        No such proof leaves this CVE and its completed watermark pending.
+        """
+        unknown = f'bootstrap old-record comparison unknown:{row["native_id"]}'
+        history = self.cursor.setdefault('material_history', {
+            'native_id': row['native_id'], 'revision': revision, 'page': 1, 'offset': 0})
+        if history.get('native_id') != row['native_id'] or history.get('revision') != revision:
+            raise ValueError(unknown + '; mismatched file-history checkpoint')
+        if history.get('exhausted'):
+            raise ValueError(unknown + '; no proven material difference in retained file history')
+        while True:
+            params = urlencode({'sha': revision, 'path': cve_path(row['native_id']),
+                'since': cutoff, 'until': self.cursor['window_end'],
+                'per_page': 100, 'page': history['page']})
+            commits = self.http.get_json(f'https://api.github.com/repos/{REPOS["cve"]}/commits?{params}')
+            if not isinstance(commits, list) or len(commits) > 100:
+                raise ValueError(unknown + '; invalid file-history page')
+            while history['offset'] < len(commits):
+                self.unit()
+                item = commits[history['offset']]
+                try:
+                    before = item['sha']
+                    committed = iso(item['commit']['committer']['date'])
+                    valid = SHA.fullmatch(before) and timestamp(cutoff) <= timestamp(committed) <= timestamp(self.cursor['window_end'])
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    valid = False
+                if not valid:
+                    raise ValueError(unknown + '; invalid retained file-history evidence')
+                old = normalize_cve(self.http.get_json(raw_url(REPOS['cve'], before, cve_path(row['native_id']))), before)
+                if old['native_id'] != row['native_id']:
+                    raise ValueError(unknown + '; file-history CVE identity mismatch')
+                if self.cve_material_fields(old, row):
+                    return old, before, committed
+                history['offset'] += 1
+            if len(commits) < 100:
+                history['exhausted'] = True
+                raise ValueError(unknown + '; no proven material difference in retained file history')
+            history.update(page=history['page'] + 1, offset=0)
 
     def cve_changes(self, revision):
         """Complete Git changes capture late source timestamps; overlap uses old heads."""
@@ -967,6 +1038,16 @@ class Run:
             raise ValueError('oversize Nuclei inventory')
         self.cursor.setdefault('offset', 0)
         paths = sorted(p for p in inventory if p.split('/')[0] in ('http', 'network') and p.endswith(('.yaml', '.yml')))
+        auxiliary = self.state.get('auxiliary_files', {})
+        auxiliary = {path: value for path, value in auxiliary.items() if path == NUCLEI_AUXILIARY
+                     and path in inventory and value.get('blob_sha') == inventory[path]['sha']}
+        if auxiliary:
+            self.state['auxiliary_files'] = auxiliary
+        else:
+            self.state.pop('auxiliary_files', None)
+        if (NUCLEI_AUXILIARY in paths and paths.index(NUCLEI_AUXILIARY) < self.cursor['offset']
+                and NUCLEI_AUXILIARY not in auxiliary):
+            raise ValueError('missing verified Nuclei auxiliary checkpoint')
         old = {x.get('path'): x for x in self.previous}
         for index in range(self.cursor['offset'], len(paths)):
             path = paths[index]
@@ -982,6 +1063,13 @@ class Run:
             if (inventory[path]['size'] or 0) > size_limit:
                 raise ValueError(f'oversize template:{path}')
             data = self.http.get_bytes(raw_url(repo, revision, path))
+            if path == NUCLEI_AUXILIARY:
+                # Keep this item in the same ordered list so old continuation
+                # offsets still identify exactly the next unprocessed file.
+                auxiliary[path] = normalize_nuclei_auxiliary(data, path, revision, inventory[path]['sha'])
+                self.state['auxiliary_files'] = auxiliary
+                self.cursor['offset'] = index + 1
+                continue
             row = normalize_template(data, path, revision, inventory[path]['sha'], max_bytes=size_limit)
             total = len(data)
             for dependency in row['dependencies']:
@@ -1003,7 +1091,7 @@ class Run:
             self.add(row)
             self.cursor['offset'] = index + 1
         self.state['coverage'] = 'current-http-network-catalog'
-        self.finish(revision, authoritative=[f'nuclei/{p}' for p in paths])
+        self.finish(revision, authoritative=[f'nuclei/{p}' for p in paths if p not in auxiliary])
 
 
 def collect(source_id, http, previous, *, now, policy, dependency=None):

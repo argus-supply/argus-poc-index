@@ -97,7 +97,8 @@ def event_types(old, new):
         proof = new.get('bootstrap_material_change')
         if proof:
             types = {'affected': 'affected_corrected', 'scores': 'score_changed', 'metrics': 'score_changed',
-                     'status': 'rejected' if new.get('status') == 'rejected' else 'withdrawn'}
+                     'status': 'rejected' if new.get('status') == 'rejected' else
+                               'disclosure' if new.get('status') == 'active' else 'withdrawn'}
             return sorted({types[key] for key in proof['changed_fields'] if key in types})
         if new.get('kev') or new['source_id'] == 'kev':
             return ['kev_added']

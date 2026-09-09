@@ -50,6 +50,7 @@ def run(repository, remote, work, job_id, *, policy, token=None, manual=False, h
         return metrics
     client = http or Http(policy, token=token, max_bytes=reservation)
     results, dependencies, dependency = {}, [], None
+    dependency_coverage, dependency_errors = {}, []
     dependency_cache, dependency_files = {}, {}
     changed_bytes = 0
     baseline_complete = False
@@ -61,6 +62,10 @@ def run(repository, remote, work, job_id, *, policy, token=None, manual=False, h
                 raise ValueError('conflicting pinned intel continuations')
             dependency, dependency_cache, dependency_files = consume_intel(client, next(iter(requested), None), previous, before_files)
             dependencies = [{k: dependency[k] for k in ('repository', 'commit_sha', 'manifest_sha256')}]
+            dependency_coverage = {dependency['repository']: {key: value for key, value in dependency.items() if key != 'records'}}
+            dependency_errors = [{'repository': dependency['repository'], 'commit_sha': dependency['commit_sha'], **error}
+                                 for error in dependency['coverage_errors']]
+            metrics.update(dependency_coverage=dependency_coverage, dependency_errors=dependency_errors)
             # All dependency HTTP transfers consume the same durable reservation.
             metrics['dependency_current_bytes'] = sum(map(len, dependency_files.values()))
         for index, registration in enumerate(enabled):
@@ -83,6 +88,8 @@ def run(repository, remote, work, job_id, *, policy, token=None, manual=False, h
                 'bytes': local.bytes, 'requests': local.requests,
                 'coverage_gaps': sources[source_id]['coverage_gaps'], 'errors': sources[source_id]['errors']}
         extra = {'dependency_cache': dependency_cache} if dependency_cache else {}
+        if dependency_coverage:
+            extra.update(dependency_coverage=dependency_coverage, dependency_errors=dependency_errors)
         if repository == 'argus-poc-index':
             expire(records, events, now, policy)
             checkpoint, metrics['reference_availability'] = refresh_reference_availability(
@@ -101,11 +108,16 @@ def run(repository, remote, work, job_id, *, policy, token=None, manual=False, h
             baseline_complete = all(sources.get(item['id'], {}).get('status') == 'ok'
                 and sources[item['id']].get('completed_watermark')
                 and not sources[item['id']].get('continuation')
-                and not sources[item['id']].get('coverage_gaps') for item in enabled)
+                and not sources[item['id']].get('coverage_gaps')
+                and not sources[item['id']].get('errors') for item in enabled)
+            if repository == 'argus-poc-index':
+                baseline_complete = baseline_complete and dependency is not None and dependency['coverage_complete'] is True
             candidate, changed = store.prepare('data', parent, files, 'chore(data): synchronize bounded public metadata')
             try:
                 if changed:
-                    metrics['git_cost'] = ledger.reserve_publication(job_id, 'data', candidate, changed_bytes, baseline_complete=baseline_complete)
+                    metrics['git_cost'] = ledger.reserve_publication(job_id, 'data', candidate, changed_bytes,
+                        baseline_complete=baseline_complete, baseline_gate_version=2,
+                        dependency_coverage=dependency_coverage or None)
                     sha, published = store.push_prepared('data', candidate)
                 else:
                     sha, published = parent, False
@@ -113,7 +125,7 @@ def run(repository, remote, work, job_id, *, policy, token=None, manual=False, h
                 metrics.update(data_commit=sha, published=published, changed_bytes=changed_bytes,
                     current_tree_bytes=sum(map(len, files.values())), manifest_sha256=digest(files['manifest.json']),
                     record_count=len(records), event_count=len(events), dependencies=dependencies,
-                    status='ok' if all(s['status'] == 'ok' for s in sources.values()) else 'partial')
+                    status='ok' if baseline_complete else 'partial')
                 break
             except ParentMoved:
                 # A newer publisher may have withdrawn records. Recollect from its
@@ -133,10 +145,13 @@ def run(repository, remote, work, job_id, *, policy, token=None, manual=False, h
             'data_commit': metrics['data_commit'], 'sources': {name: {key: value.get(key) for key in
                 ('status', 'last_attempt_at', 'last_success_at', 'coverage_gaps', 'errors')}
                 for name, value in sources.items()}}
+        if dependency_coverage:
+            health.update(dependency_coverage=dependency_coverage, dependency_errors=dependency_errors)
         try:
             ledger.settle(job_id, client.bytes, client.requests, changed_bytes if metrics['published'] else 0,
                 bootstrap=bootstrap, health=health, published=metrics['published'],
                 baseline_complete=baseline_complete, baseline_data_commit=metrics['data_commit'],
+                baseline_gate_version=2, dependency_coverage=dependency_coverage or None,
                 runner_seconds=time.time() - float(os.environ.get('ARGUS_JOB_STARTED_AT', time.time() - (time.monotonic() - started))))
         except Exception as error:
             metrics['status'] = 'partial'
@@ -147,6 +162,7 @@ def run(repository, remote, work, job_id, *, policy, token=None, manual=False, h
         metrics['candidate_full_changed_file_bytes'] = changed_bytes
         metrics['full_changed_file_bytes'] = changed_bytes if metrics['published'] else 0
         metrics['baseline_complete'] = baseline_complete
+        metrics['baseline_gate_version'] = 2
 
 
 def main():

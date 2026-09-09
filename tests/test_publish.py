@@ -1,5 +1,6 @@
 """Local Git publication evidence: reservations precede main and survive failures."""
 import copy
+import datetime as dt
 import json
 import os
 from pathlib import Path
@@ -105,6 +106,15 @@ class PublishCostTests(unittest.TestCase):
         self.assertEqual([row['status'] for row in self.saved],
                          ['pending', 'work-reserved', 'publication-reserved', 'pushed', 'published'])
 
+    def test_candidate_dates_are_utc_without_inheriting_stale_overrides(self):
+        self.seed()
+        with patch.dict(os.environ, TZ='Asia/Shanghai', GIT_AUTHOR_DATE='2000-01-01T00:00:00+0800',
+                        GIT_COMMITTER_DATE='2000-01-01T00:00:00+0800'):
+            prepared = self.candidate()
+        dates = self.git('-C', str(self.target), 'show', '-s', '--format=%aI%n%cI', prepared['candidate']).splitlines()
+        parsed = [dt.datetime.fromisoformat(value.replace('Z', '+00:00')) for value in dates]
+        self.assertTrue(all(value.utcoffset() == dt.timedelta(0) and value.year > 2000 for value in parsed), dates)
+
     def test_completed_data_baseline_puts_main_in_steady_phase(self):
         self.seed(complete=True)
         baseline = self.ledger.read()[1]['git_cost']['baseline_completed_at']
@@ -207,7 +217,7 @@ class PublishPreparationTests(unittest.TestCase):
              patch.object(publish.subprocess, 'run', return_value=Mock(returncode=0, stdout='passed\n', stderr='')) as run, \
              patch.dict(os.environ, GH_TOKEN='fixture-token', GITHUB_TOKEN='another-fixture-token'):
             self.run_tests()
-        self.assertEqual(run.call_args.kwargs['timeout'], 600)
+        self.assertEqual(run.call_args.kwargs['timeout'], 900)
         self.assertNotIn('GH_TOKEN', run.call_args.kwargs['env'])
         self.assertNotIn('GITHUB_TOKEN', run.call_args.kwargs['env'])
         self.assertEqual(len(command.call_args_list), 3)
@@ -264,6 +274,9 @@ class PublishPreparationTests(unittest.TestCase):
         report_path.write_text(json.dumps({'worktrees': {name: str(self.root / name) for name in publish.REPOS}}))
 
         def test(source, target, name, commit, report_directory):
+            pending = json.loads(report_path.read_text())
+            self.assertTrue(all(value['source_commit'] == commit for value in pending['standalone_tests'].values()))
+            self.assertEqual(pending['standalone_tests'][name]['status'], 'pending')
             if name == publish.REPOS[1]:
                 raise RuntimeError('fixture test failure')
 
@@ -272,6 +285,7 @@ class PublishPreparationTests(unittest.TestCase):
              patch.object(publish, 'command', return_value=Mock(stdout=b'')) as command, \
              patch.object(publish.tarfile, 'open'), \
              patch.object(publish.tempfile, 'mkdtemp', return_value=str(self.root / 'export')), \
+             patch.object(publish, 'ThreadPoolExecutor', wraps=publish.ThreadPoolExecutor) as executor, \
              patch.object(publish, 'test_target', side_effect=test) as tests, \
              patch.object(publish, 'prepare_candidate') as prepare, \
              patch.object(publish, 'publish_candidate') as push:
@@ -280,6 +294,7 @@ class PublishPreparationTests(unittest.TestCase):
         prepare.assert_not_called()
         push.assert_not_called()
         self.assertEqual(tests.call_count, 3)
+        executor.assert_called_once_with(max_workers=2)
         self.assertEqual(command.call_count, 1)
         report = json.loads(report_path.read_text())
         self.assertEqual([report['standalone_tests'][name]['status'] for name in publish.REPOS], ['passed', 'failed', 'passed'])
@@ -289,6 +304,22 @@ class PublishPreparationTests(unittest.TestCase):
             self.assertEqual(publish.remote_url(name), 'https://github.com/argus-supply/' + name + '.git')
         with self.assertRaises(ValueError):
             publish.remote_url('another-repository')
+
+    def test_api_transport_imports_only_inspected_parent_and_keeps_collector_default(self):
+        with patch('tools.github_api_store.GitHubApiStore') as api, patch('sync.gitstore.GitStore') as native:
+            store = publish.publication_store(self.root / 'shadow', self.repository, 'fixture-token',
+                                              'github-api', self.root, 'a' * 40)
+            api.assert_called_once_with(self.root / 'shadow', self.repository, 'fixture-token')
+            store.import_local_snapshot.assert_called_once_with(self.root, 'a' * 40)
+            native.assert_not_called()
+            publish.publication_store(self.root / 'native', self.repository, 'fixture-token',
+                                      'git', self.root, 'a' * 40)
+            native.assert_called_once()
+
+    def test_unknown_transport_is_refused(self):
+        with self.assertRaisesRegex(ValueError, 'unsupported publication transport'):
+            publish.publication_store(self.root / 'shadow', self.repository, 'fixture-token',
+                                      'contents-api', self.root, 'a' * 40)
 
 
 if __name__ == '__main__':

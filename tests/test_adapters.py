@@ -10,10 +10,10 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from sync.adapters import (AdapterResult, CVE, Run, collect, cve_path, normalize_cve, normalize_ghsa,
-                           normalize_kev, normalize_template, raw_url)
+                           normalize_kev, normalize_template, normalize_nuclei_auxiliary, NUCLEI_AUXILIARY, raw_url)
 from sync.core import ROOT, apply_result, build_snapshot, canonical as stored_json, load_policy, read_snapshot
 from sync.gitstore import GitStore
-from sync.http import FetchError, Http
+from sync.http import BudgetExceeded, FetchError, Http
 from sync.run import run as run_collector
 
 REV = 'a' * 40
@@ -237,6 +237,140 @@ class SourceContracts(unittest.TestCase):
         self.assertEqual(result.continuation['offset'], 0)
         self.assertIsNone(result.completed_watermark)
         self.assertIn('comparison unknown', result.errors[0]['message'])
+
+    def cve_missing_global_baseline(self, pages, snapshots, *, previous=None, request_limit=1000):
+        identifier = 'CVE-2026-19387'
+        current = cve(identifier)
+        current['cveMetadata']['datePublished'] = '2026-08-09T23:55:00Z'
+        cutoff = '2026-08-10T00:00:00Z'
+        state = {'revision': REV, 'status': 'partial', 'completed_watermark': None, 'continuation': {
+            'revision': REV, 'retention_start': cutoff, 'target_start': cutoff, 'window_end': NOW,
+            'snapshot_revision': REV, 'pending': [identifier], 'offset': 0,
+            'log_oldest': '2026-08-01T00:00:00Z', 'material_baseline_revision': OLDER}}
+
+        def handler(url):
+            if '/commits?' in url:
+                query = parse_qs(urlsplit(url).query)
+                self.assertEqual(query['sha'], [REV])
+                self.assertEqual(query['path'], [cve_path(identifier)])
+                self.assertEqual(query['since'], [cutoff])
+                self.assertEqual(query['until'], [NOW])
+                self.assertEqual(query['per_page'], ['100'])
+                return pages[int(query['page'][0])]
+            if '/' + OLDER + '/' in url:
+                raise FetchError('upstream HTTP 404', status=404)
+            if '/' + REV + '/' in url:
+                return copy.deepcopy(current)
+            revision = url.split('/CVEProject/cvelistV5/', 1)[1].split('/', 1)[0]
+            return copy.deepcopy(snapshots[revision])
+
+        class BoundedHTTP(HTTP):
+            def get_json(self, url, headers=None):
+                if len(self.urls) >= request_limit:
+                    raise BudgetExceeded('fixture request budget exhausted')
+                return super().get_json(url, headers)
+
+        return BoundedHTTP(handler), previous or {'state': state}, current
+
+    def test_cve_baseline_404_uses_proven_retained_snapshot_without_new_disclosure(self):
+        historical = 'c' * 40
+        old = cve('CVE-2026-19387')
+        old['cveMetadata']['datePublished'] = '2026-08-09T23:55:00Z'
+        old['containers']['cna']['affected'][0]['versions'][0]['lessThan'] = '1.1'
+        page = [{'sha': historical, 'commit': {'committer': {'date': '2026-08-10T00:10:00Z'}}}]
+        http, previous, current = self.cve_missing_global_baseline({1: page}, {historical: old})
+        result = collect('cve', http, previous, now=NOW, policy={'bootstrap_days': 30})
+        self.assertEqual(result.status, 'ok', result.errors)
+        self.assertEqual(result.completed_watermark, NOW)
+        row = result.records[0]
+        self.assertEqual(row['published_at'], current['cveMetadata']['datePublished'])
+        self.assertEqual(row['bootstrap_material_change']['baseline_revision'], historical)
+        self.assertEqual(row['bootstrap_material_change']['window_start'], '2026-08-10T00:10:00Z')
+        self.assertEqual(row['bootstrap_material_change']['changed_fields'], ['affected'])
+        records, events, sources = {}, {}, {}
+        apply_result(records, events, sources, 'cve', result, NOW, load_policy(ROOT / 'policy.json'))
+        self.assertEqual({event['event_type'] for event in events.values()}, {'affected_corrected'})
+        self.assertTrue(all(event['source_occurred_at'] is None for event in events.values()))
+        self.assertEqual(records[row['record_id']]['affected'], normalize_cve(current, REV)['affected'])
+
+    def test_cve_baseline_404_history_budget_resumes_exact_uncompared_commit(self):
+        same, changed = 'c' * 40, 'd' * 40
+        current = cve('CVE-2026-19387')
+        current['cveMetadata']['datePublished'] = '2026-08-09T23:55:00Z'
+        before = copy.deepcopy(current)
+        before['containers']['cna']['metrics'] = [{'cvssV3_1': {'baseScore': 7.5}}]
+        page = [{'sha': same, 'commit': {'committer': {'date': '2026-09-08T00:00:00Z'}}},
+                {'sha': changed, 'commit': {'committer': {'date': '2026-08-19T00:00:00Z'}}}]
+        pages, snapshots = {1: page}, {same: current, changed: before}
+        first_http, previous, _ = self.cve_missing_global_baseline(pages, snapshots, request_limit=4)
+        first = collect('cve', first_http, previous, now=NOW, policy={'bootstrap_days': 30})
+        self.assertEqual(first.status, 'partial')
+        self.assertEqual(first.records, [])
+        self.assertIsNone(first.completed_watermark)
+        self.assertEqual(first.continuation['offset'], 0)
+        self.assertEqual(first.continuation['material_history']['offset'], 1)
+        second_http, previous, _ = self.cve_missing_global_baseline(pages, snapshots,
+            previous={'state': first.state}, request_limit=4)
+        second = collect('cve', second_http, previous, now=NOW, policy={'bootstrap_days': 30})
+        self.assertEqual(second.status, 'ok', second.errors)
+        self.assertFalse(any('/' + same + '/' in url for url in second_http.urls))
+        self.assertEqual(second.records[0]['bootstrap_material_change']['changed_fields'], ['scores'])
+        self.assertIsNone(second.continuation)
+
+    def test_cve_baseline_404_metadata_only_or_missing_history_never_advances_watermark(self):
+        historical = 'c' * 40
+        old = cve('CVE-2026-19387')
+        old['cveMetadata']['datePublished'] = '2026-08-09T23:55:00Z'
+        old['containers']['cna']['title'] = 'Only title changed'
+        entry = {'sha': historical, 'commit': {'committer': {'date': '2026-08-10T00:10:00Z'}}}
+        for page in ([], [entry]):
+            with self.subTest(page=page):
+                http, previous, _ = self.cve_missing_global_baseline({1: page}, {historical: old})
+                result = collect('cve', http, previous, now=NOW, policy={'bootstrap_days': 30})
+                self.assertEqual(result.status, 'partial')
+                self.assertEqual(result.records, [])
+                self.assertIsNone(result.completed_watermark)
+                self.assertEqual(result.continuation['offset'], 0)
+                self.assertTrue(result.continuation['material_history']['exhausted'])
+                self.assertNotIn('bootstrap_old_records_without_material_change', result.state)
+                self.assertIn('no proven material difference', result.errors[0]['message'])
+
+    def test_cve_baseline_404_history_continues_second_page_after_unit_limit(self):
+        current = cve('CVE-2026-19387')
+        current['cveMetadata']['datePublished'] = '2026-08-09T23:55:00Z'
+        identifiers = [f'{index + 1:040x}' for index in range(101)]
+        entries = [{'sha': identifier, 'commit': {'committer': {'date': '2026-08-19T00:00:00Z'}}}
+                   for identifier in identifiers]
+        snapshots = {identifier: copy.deepcopy(current) for identifier in identifiers}
+        snapshots[identifiers[-1]]['containers']['cna']['affected'][0]['versions'][0]['lessThan'] = '1.1'
+        pages = {1: entries[:100], 2: entries[100:]}
+        http, previous, _ = self.cve_missing_global_baseline(pages, snapshots)
+        first = collect('cve', http, previous, now=NOW, policy={'bootstrap_days': 30, 'adapter_max_units': 101})
+        self.assertEqual(first.status, 'partial')
+        self.assertEqual(first.continuation['material_history']['page'], 2)
+        self.assertEqual(first.continuation['material_history']['offset'], 0)
+        self.assertEqual(first.continuation['offset'], 0)
+        resumed_http, previous, _ = self.cve_missing_global_baseline(pages, snapshots, previous={'state': first.state})
+        second = collect('cve', resumed_http, previous, now=NOW, policy={'bootstrap_days': 30})
+        self.assertEqual(second.status, 'ok', second.errors)
+        self.assertEqual(second.records[0]['bootstrap_material_change']['baseline_revision'], identifiers[-1])
+        self.assertEqual([parse_qs(urlsplit(url).query)['page'] for url in resumed_http.urls if '/commits?' in url], [['2']])
+
+    def test_cve_baseline_404_rejects_out_of_window_or_wrong_identity_proof(self):
+        historical = 'c' * 40
+        for date, identifier in (('2026-08-09T23:59:59Z', 'CVE-2026-19387'),
+                                 ('2026-08-19T00:00:00Z', 'CVE-2026-9999')):
+            with self.subTest(date=date, identifier=identifier):
+                old = cve(identifier)
+                old['containers']['cna']['affected'][0]['versions'][0]['lessThan'] = '1.1'
+                page = [{'sha': historical, 'commit': {'committer': {'date': date}}}]
+                http, previous, _ = self.cve_missing_global_baseline({1: page}, {historical: old})
+                result = collect('cve', http, previous, now=NOW, policy={'bootstrap_days': 30})
+                self.assertEqual(result.status, 'partial')
+                self.assertEqual(result.records, [])
+                self.assertEqual(result.continuation['offset'], 0)
+                self.assertEqual(result.continuation['material_history']['offset'], 0)
+                self.assertIsNone(result.completed_watermark)
 
     def test_existing_old_record_is_refreshed_without_discovery_reclassification(self):
         result = self.old_bootstrap(already_retained=True)
@@ -744,6 +878,114 @@ class SourceContracts(unittest.TestCase):
         self.assertIsNone(row['engine']['minimum_version'])
         self.assertFalse(row['verification']['executed'])
 
+    def nuclei_auxiliary_fixture(self, revision=REV, *, mapping=b'node.js: nodejs\n', previous=None, units=400):
+        templates = {'http/technologies/a.yaml': self.template(), 'http/technologies/z.yaml': self.template()}
+        bodies = {**templates, **({NUCLEI_AUXILIARY: mapping} if mapping is not None else {})}
+        tree = {'truncated': False, 'tree': [{'type': 'blob', 'mode': '100644', 'path': path,
+            'sha': hashlib.sha1(b'blob ' + str(len(body)).encode() + b'\0' + body).hexdigest(),
+            'size': len(body)} for path, body in bodies.items()]}
+        def handler(url):
+            if '/commits/HEAD' in url:
+                return {'sha': revision}
+            if '/git/trees/' in url:
+                self.assertIn(revision, url)
+                return tree
+            return bodies[url.split('/' + revision + '/', 1)[1]]
+        client = HTTP(handler)
+        result = collect('nuclei', client, previous or {}, now=NOW, policy={'adapter_max_units': units})
+        return result, client
+
+    def test_nuclei_auxiliary_mapping_preserves_old_offsets_and_next_template(self):
+        first_row = self.template_row(self.template(), 'http/technologies/a.yaml')
+        previous = {'records': [first_row], 'state': {'status': 'partial', 'revision': REV,
+            'completed_watermark': None, 'continuation': {'revision': REV, 'offset': 1}}}
+        first, _ = self.nuclei_auxiliary_fixture(previous=previous, units=1)
+        self.assertEqual(first.status, 'partial')
+        self.assertEqual(first.continuation['offset'], 2)
+        self.assertEqual(first.records, [])
+        self.assertIsNone(first.completed_watermark)
+        auxiliary = first.state['auxiliary_files'][NUCLEI_AUXILIARY]
+        self.assertEqual(auxiliary['mapping'], {'node.js': 'nodejs'})
+        self.assertEqual(auxiliary['source_commit'], REV)
+        self.assertEqual(auxiliary['classification'], 'automatic-scan-technology-tags')
+        self.assertFalse(auxiliary['executed'])
+        self.assertNotIn('template_id', auxiliary)
+        final, client = self.nuclei_auxiliary_fixture(previous={'records': [first_row], 'state': first.state})
+        self.assertEqual(final.status, 'ok', final.errors)
+        self.assertEqual([row['path'] for row in final.records], ['http/technologies/z.yaml'])
+        self.assertEqual(final.authoritative_ids,
+            ['nuclei/http/technologies/a.yaml', 'nuclei/http/technologies/z.yaml'])
+        self.assertFalse(any(NUCLEI_AUXILIARY in url for url in client.urls))
+        repeated, _ = self.nuclei_auxiliary_fixture(previous={'records': [first_row, *final.records], 'state': final.state})
+        self.assertEqual(repeated.status, 'ok')
+        self.assertEqual(repeated.records, [])
+        self.assertEqual(repeated.state['auxiliary_files'], final.state['auxiliary_files'])
+
+    def test_nuclei_auxiliary_change_and_removal_update_metadata_without_template_events(self):
+        first, _ = self.nuclei_auxiliary_fixture()
+        changed, _ = self.nuclei_auxiliary_fixture(OLDER, mapping=b'node.js: nodejs,javascript\n',
+            previous={'records': first.records, 'state': first.state})
+        self.assertEqual(changed.status, 'ok', changed.errors)
+        self.assertEqual(changed.records, [])
+        before, after = first.state['auxiliary_files'][NUCLEI_AUXILIARY], changed.state['auxiliary_files'][NUCLEI_AUXILIARY]
+        self.assertNotEqual(before['blob_sha'], after['blob_sha'])
+        self.assertNotEqual(before['sha256'], after['sha256'])
+        self.assertEqual(after['source_commit'], OLDER)
+        self.assertEqual(after['mapping'], {'node.js': 'nodejs,javascript'})
+        removed, _ = self.nuclei_auxiliary_fixture('c' * 40, mapping=None,
+            previous={'records': first.records, 'state': changed.state})
+        self.assertEqual(removed.status, 'ok', removed.errors)
+        self.assertEqual(removed.records, [])
+        self.assertNotIn('auxiliary_files', removed.state)
+        self.assertEqual(removed.authoritative_ids, first.authoritative_ids)
+
+    def test_nuclei_auxiliary_unknown_shape_hash_or_size_stays_unprocessed(self):
+        for data in (b'id: actual-template\ninfo: {}\n', b'node.js: [nodejs]\n', b'node.js: null\n',
+                     b'node.js: &a nodejs\nother: *a\n'):
+            with self.subTest(data=data):
+                result, _ = self.nuclei_auxiliary_fixture(mapping=data)
+                self.assertEqual(result.status, 'partial')
+                self.assertEqual(result.continuation['offset'], 1)
+                self.assertIsNone(result.completed_watermark)
+                self.assertNotIn('auxiliary_files', result.state)
+        with self.assertRaisesRegex(ValueError, 'hash mismatch'):
+            normalize_nuclei_auxiliary(b'node.js: nodejs', NUCLEI_AUXILIARY, REV, '0' * 40)
+        with self.assertRaisesRegex(ValueError, 'oversized'):
+            normalize_nuclei_auxiliary(b'x' * 65537, NUCLEI_AUXILIARY, REV, '0' * 40)
+        with self.assertRaisesRegex(ValueError, 'invalid template metadata'):
+            self.template_row(b'node.js: nodejs', 'http/technologies/unknown-mapping.yml')
+
+    def test_nuclei_auxiliary_cannot_be_omitted_by_a_cursor_without_classification_evidence(self):
+        result, _ = self.nuclei_auxiliary_fixture(previous={'state': {'status': 'partial',
+            'revision': REV, 'continuation': {'revision': REV, 'offset': 2}}})
+        self.assertEqual(result.status, 'partial')
+        self.assertEqual(result.continuation['offset'], 2)
+        self.assertIsNone(result.completed_watermark)
+        self.assertIn('missing verified Nuclei auxiliary checkpoint', result.errors[0]['message'])
+
+    def test_nuclei_auxiliary_remains_available_to_verified_template_dependencies(self):
+        template = self.template('    payloads:\n      technologies: ' + NUCLEI_AUXILIARY + '\n')
+        mapping = b'node.js: nodejs\n'
+        bodies = {'http/technologies/a.yaml': template, NUCLEI_AUXILIARY: mapping}
+        entries = [{'type': 'blob', 'mode': '100644', 'path': path, 'size': len(body),
+            'sha': hashlib.sha1(b'blob ' + str(len(body)).encode() + b'\0' + body).hexdigest()}
+            for path, body in bodies.items()]
+        def handler(url):
+            if '/commits/HEAD' in url:
+                return {'sha': REV}
+            if '/git/trees/' in url:
+                return {'truncated': False, 'tree': entries}
+            return bodies[url.split('/' + REV + '/', 1)[1]]
+        result = collect('nuclei', HTTP(handler), {}, now=NOW, policy={})
+        self.assertEqual(result.status, 'ok', result.errors)
+        self.assertEqual(len(result.records), 1)
+        dependency = result.records[0]['dependencies'][0]
+        self.assertEqual(dependency['path'], NUCLEI_AUXILIARY)
+        self.assertEqual(dependency['status'], 'verified')
+        self.assertEqual(dependency['sha256'], hashlib.sha256(mapping).hexdigest())
+        self.assertEqual(dependency['blob_sha'], result.state['auxiliary_files'][NUCLEI_AUXILIARY]['blob_sha'])
+        self.assertEqual(result.authoritative_ids, ['nuclei/http/technologies/a.yaml'])
+
     def test_non_url_template_references_are_inert_text_with_warnings(self):
         references = ['https://example.com/advisory', 'Vendor advisory DOC-123',
                       'javascript:alert(1)', 'file:///etc/passwd', 'https://user:password@example.com/private', 42]
@@ -850,8 +1092,15 @@ class OfficialReferenceRunnerTests(unittest.TestCase):
                                   'relationship': 'upstream-reference'}]
             rows.append(row)
         records, events, sources = {}, {}, {}
-        apply_result(records, events, sources, 'ghsa', AdapterResult(records=rows, status='ok', revision=REV),
+        apply_result(records, events, sources, 'ghsa', AdapterResult(records=rows, status='ok', revision=REV,
+                     completed_watermark=NOW),
                      NOW, policy)
+        # This fixture isolates reference batching against a complete fixed
+        # dependency. Missing required intel sources correctly keep a real PoC
+        # run partial, so certify the two intentionally empty source catalogs.
+        for source in ('cve', 'kev'):
+            apply_result(records, events, sources, source, AdapterResult(records=[], status='ok', revision=REV,
+                         completed_watermark=NOW), NOW, policy)
         intel_files, _ = build_snapshot('argus-supply/argus-intel-data', records, events, sources,
                                        policy, NOW, 'fixture')
 

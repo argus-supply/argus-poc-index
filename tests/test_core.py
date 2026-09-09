@@ -31,6 +31,21 @@ class CoreTests(unittest.TestCase):
         return build_snapshot('argus-supply/argus-intel-data', self.records, self.events,
             self.sources, self.policy, now, 'test', previous)
 
+    def test_proven_reactivation_in_bootstrap_is_not_a_withdrawal(self):
+        row = copy.deepcopy(self.row)
+        row['status'] = 'active'
+        row['published_at'] = '2020-01-01T00:00:00Z'
+        row['bootstrap_material_change'] = {'baseline_revision': 'b' * 40,
+            'window_start': '2026-09-01T00:00:00Z', 'window_end': NOW,
+            'changed_fields': ['status'], 'before_status': 'rejected',
+            'timing': 'observed-state-difference-within-interval'}
+        self.apply(row)
+        event = next(iter(self.events.values()))
+        self.assertEqual(event['event_type'], 'disclosure')
+        self.assertIsNone(event['source_occurred_at'])
+        self.assertEqual(event['source_occurrence_window']['from'], '2026-09-01T00:00:00Z')
+        self.assertEqual(self.records[row['record_id']]['published_at'], '2020-01-01T00:00:00Z')
+
     def test_a01_same_input_preserves_records_events_and_same_day_manifest(self):
         self.apply()
         first, manifest = self.snapshot()

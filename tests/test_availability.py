@@ -14,6 +14,7 @@ from unittest.mock import patch
 from sync.adapters import AdapterResult
 from sync.availability import refresh, validate_policy
 from sync.core import ROOT, canonical, digest, load_policy, read_snapshot, build_snapshot
+from sync.dependency import coverage_summary
 from sync.gitstore import GitStore
 from sync.http import BudgetExceeded, FetchError, Http, Redirects, reference_allowed
 from sync.run import run
@@ -170,7 +171,9 @@ class AvailabilityTests(unittest.TestCase):
             remote = root / 'remote.git'
             subprocess.run(['git', 'init', '--bare', str(remote)], check=True, capture_output=True)
             dependency = {'repository': 'argus-supply/argus-intel-data', 'commit_sha': 'a' * 40,
-                          'manifest_sha256': 'b' * 64, 'records': []}
+                          'manifest_sha256': 'b' * 64, 'records': [],
+                          **coverage_summary({'sources': {source: {'status': 'ok', 'completed_watermark': NOW}
+                              for source in ('cve', 'ghsa', 'kev')}})}
             snapshots = []
             for number, (stamp, statuses, limit) in enumerate([
                 (NOW, [404], 500), ('2026-09-09T06:00:00Z', [], 500),

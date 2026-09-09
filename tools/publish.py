@@ -18,7 +18,9 @@ import tempfile
 import uuid
 
 REPOS = ('argus-intel-data', 'argus-poc-index', 'argus-detection-resources')
-TEST_TIMEOUT_SECONDS = 600
+# Local macOS bare-Git regression runs exceed ten minutes. This verifier wait
+# does not change CI's ten-minute or collection's twelve-minute job budgets.
+TEST_TIMEOUT_SECONDS = 900
 
 
 def command(args, *, timeout=240, **kwargs):
@@ -56,7 +58,7 @@ def test_target(source, target, repository, commit, report_directory):
     except subprocess.TimeoutExpired as error:
         parts = [value.decode(errors='replace') if isinstance(value, bytes) else value or ''
                  for value in (error.stdout, error.stderr)]
-        log.write_text(''.join(parts) + '\nFAILED: standalone tests exceeded 600 seconds\n')
+        log.write_text(''.join(parts) + f'\nFAILED: standalone tests exceeded {TEST_TIMEOUT_SECONDS} seconds\n')
         raise RuntimeError('standalone tests timed out: ' + repository) from error
     log.write_text(tested.stdout + tested.stderr)
     if tested.returncode:
@@ -78,7 +80,12 @@ def prepare_candidate(target, repository, report_directory):
     if changed:
         (report_directory / (repository + '-staged-diff.txt')).write_text(
             output([*git, 'diff', '--cached', '--stat']) + '\n')
-        command([*git, 'commit', '-m', 'fix(data): update pinned bounded collector'], capture_output=True)
+        # REST commit responses normalize dates to UTC. Generate this new local
+        # candidate in UTC so its exact precharged SHA survives either transport.
+        env = dict(os.environ, TZ='UTC')
+        for key in ('GIT_AUTHOR_DATE', 'GIT_COMMITTER_DATE'):
+            env.pop(key, None)
+        command([*git, 'commit', '-m', 'fix(data): update pinned bounded collector'], capture_output=True, env=env)
     candidate = output([*git, 'rev-parse', 'HEAD'])
     raw = command([*git, 'diff', '--raw', '-z', '--no-abbrev', '--no-renames', parent, candidate], capture_output=True).stdout
     changed_bytes = 0
@@ -106,6 +113,8 @@ def publish_candidate(repository, prepared, store, ledger, record, save):
         record['control_measurements'] = list(ledger.control_measurements)
         record['control_measured_pack_bytes'] = sum(item['measured_pack_bytes'] for item in ledger.control_measurements)
         record['control_charged_upper_bound_bytes'] = sum(item['charged_upper_bound_bytes'] for item in ledger.control_measurements)
+        if hasattr(store, 'api'):
+            record['admin_transport'] = store.api.report()
         save()
 
     try:
@@ -151,10 +160,26 @@ def publish_candidate(repository, prepared, store, ledger, record, save):
         raise
 
 
+def publication_store(path, repository, token, transport, target, parent):
+    """Select an explicit admin transport without changing collector HTTP quotas."""
+    remote_url(repository)
+    if transport == 'github-api':
+        from tools.github_api_store import GitHubApiStore
+        store = GitHubApiStore(path, repository, token)
+        store.import_local_snapshot(target, parent)
+        return store
+    if transport != 'git':
+        raise ValueError('unsupported publication transport')
+    from sync.gitstore import GitStore
+    return GitStore(path, remote_url(repository), token)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-commit', required=True)
     parser.add_argument('--report-directory', type=Path, required=True)
+    parser.add_argument('--transport', choices=('git', 'github-api'), default='git',
+                        help='explicit local admin fallback; collectors retain native Git')
     args = parser.parse_args()
     application = Path(__file__).resolve().parents[3]
     report_directory = args.report_directory.resolve()
@@ -173,23 +198,26 @@ def main():
     with tarfile.open(fileobj=io.BytesIO(data)) as archive:
         archive.extractall(export, filter='data')
     source = export / 'services/argus-data-sync'
-    report.update(source_commit=commit, source_export=str(source))
+    report.update(source_commit=commit, source_export=str(source), publication_transport=args.transport)
 
     def save():
         temporary = report_path.with_suffix('.json.tmp')
         temporary.write_text(json.dumps(report, indent=2) + '\n')
         temporary.replace(report_path)
 
+    report['standalone_tests'] = {name: {'status': 'pending', 'source_commit': commit,
+        'timeout_seconds': TEST_TIMEOUT_SECONDS} for name in REPOS}
+    save()
     failures = []
-    with ThreadPoolExecutor(max_workers=len(REPOS)) as executor:
+    with ThreadPoolExecutor(max_workers=2) as executor:
         futures = {name: executor.submit(test_target, source, targets[name], name, commit, report_directory) for name in REPOS}
         for name, future in futures.items():
             try:
                 future.result()
-                state = {'status': 'passed', 'timeout_seconds': TEST_TIMEOUT_SECONDS}
+                state = {'status': 'passed', 'source_commit': commit, 'timeout_seconds': TEST_TIMEOUT_SECONDS}
             except Exception as error:
                 failures.append(name)
-                state = {'status': 'failed', 'error': str(error), 'timeout_seconds': TEST_TIMEOUT_SECONDS}
+                state = {'status': 'failed', 'source_commit': commit, 'error': str(error), 'timeout_seconds': TEST_TIMEOUT_SECONDS}
             report.setdefault('standalone_tests', {})[name] = state
             save()
     if failures:
@@ -198,7 +226,6 @@ def main():
     # Cost policy and ledger implementation must come from the exact tested export.
     sys.path.insert(0, str(source))
     from sync.core import load_policy
-    from sync.gitstore import GitStore
     from sync.ledger import Ledger
     policy = load_policy(source / 'policy.json')
     token = os.getenv('GH_TOKEN') or os.getenv('GITHUB_TOKEN') or command(
@@ -206,8 +233,10 @@ def main():
     if not token:
         raise SystemExit('a GitHub publication token is required')
     for name in REPOS:
-        store = GitStore(export / 'publication-ledgers' / (name + '.git'), remote_url(name), token)
-        store.env.update(GIT_TRACE='0', GIT_TRACE_CURL='0', GIT_CURL_VERBOSE='0')
+        store = publication_store(export / 'publication-ledgers' / (name + '.git'), name,
+            token, args.transport, targets[name], prepared[name]['parent'])
+        store.env.update(GIT_TRACE='0', GIT_TRACE_CURL='0')
+        store.env.pop('GIT_CURL_VERBOSE', None)
         ledger = Ledger(store, policy)
         record = {'source_commit': commit, 'remote': remote_url(name), 'shadow': str(store.path)}
         report.setdefault('main_publications', []).append(record)
