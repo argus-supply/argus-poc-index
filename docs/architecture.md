@@ -10,4 +10,4 @@ The control branch reserves daily bytes before upstream access. Crashed reservat
 
 Baseline collection starts with seven days and remains partial until 30-day coverage is established. Requests, wire bytes, record/shard/tree size and history growth are bounded by `policy.json`. Cron enabled: true. Runtime acceptance, real schedules and 24-hour costs are recorded separately in the ARGUS implementation report.
 
-Generated code provenance: `1dccdf6c725a2b6e34ab38ab3c4a923f7a96b7bb`. Verify with `python tools/check_distribution.py`; edit the application source and regenerate.
+Generated code provenance: `ba4d7f732bd973caccc9d1e2e85f30fda73b3da6`. Verify with `python tools/check_distribution.py`; edit the application source and regenerate.

@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import yaml
 
@@ -76,6 +76,47 @@ def public_url(value):
     if parsed.scheme not in ('https', 'http') or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError('invalid public reference URL')
     return value
+
+
+def advisory_page_url(url, filters):
+    """Accept only the original advisory query plus one opaque GitHub cursor."""
+    if not isinstance(url, str) or len(url) > 8192 or any(ord(char) < 33 or ord(char) == 127 for char in url):
+        raise ValueError('invalid GHSA pagination URL')
+    parsed = urlsplit(url)
+    if (parsed.scheme != 'https' or parsed.netloc != 'api.github.com' or
+            parsed.path != '/advisories' or parsed.fragment):
+        raise ValueError('GHSA pagination origin or path changed')
+    pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+    query = dict(pairs)
+    if len(query) != len(pairs):
+        raise ValueError('duplicate GHSA pagination parameter')
+    cursors = set(query) - set(filters)
+    if cursors not in (set(), {'after'}, {'before'}) or any(query.get(key) != value for key, value in filters.items()):
+        raise ValueError('GHSA pagination filters changed')
+    if cursors and not query[next(iter(cursors))]:
+        raise ValueError('empty GHSA pagination cursor')
+    return 'https://api.github.com/advisories?' + urlencode(sorted(query.items()))
+
+
+def advisory_next_url(headers, filters):
+    """Read the documented Link next relation without following untrusted URLs."""
+    link = next((value for key, value in headers.items() if key.lower() == 'link'), '')
+    if not isinstance(link, str) or len(link) > 16384:
+        raise ValueError('invalid GHSA pagination Link header')
+    next_url = None
+    for entry in re.split(r',(?=\s*<)', link) if link else []:
+        match = re.fullmatch(r'\s*<([^<>]+)>\s*(.*)', entry)
+        if not match:
+            raise ValueError('malformed GHSA pagination Link entry')
+        relations = re.findall(r'(?:^|;)\s*rel\s*=\s*(?:"([^"]*)"|([^;\s]+))', match[2])
+        if len(relations) != 1:
+            raise ValueError('ambiguous GHSA pagination Link relation')
+        if 'next' not in (relations[0][0] or relations[0][1]).split():
+            continue
+        if next_url is not None:
+            raise ValueError('multiple GHSA pagination next links')
+        next_url = advisory_page_url(match[1], filters)
+    return next_url
 
 
 def raw_url(repo, revision, path):
@@ -237,7 +278,7 @@ def normalize_template(data, path, revision, blob_sha, *, max_bytes=2 * 1024 * 1
     identifiers = classification.get('cve-id', [])
     identifiers = [identifiers] if isinstance(identifiers, str) else identifiers
     refs = info.get('reference', [])
-    refs = [refs] if isinstance(refs, str) else refs
+    refs = refs if isinstance(refs, list) else [refs]
     aliases = set(x.upper() for x in identifiers if isinstance(x, str) and CVE.fullmatch(x.upper()))
     for value in tags:
         if isinstance(value, str) and CVE.fullmatch(value.upper()):
@@ -271,7 +312,18 @@ def normalize_template(data, path, revision, blob_sha, *, max_bytes=2 * 1024 * 1
             'browser': 'headless' in raw, 'out_of_band': '{{interactsh-url}}' in text,
             'code': 'code' in raw or 'javascript' in raw, 'configuration': None},
         'verification': {'status': 'metadata-only', 'executed': False}})
-    row['references'] = [{'url': public_url(x)} for x in refs]
+    row['references'] = []
+    for value in refs:
+        try:
+            url = public_url(value)
+        except ValueError:
+            text_value = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+            row['references'].append({'text': text_value, 'relationship': 'upstream-reference', 'retrievable': False})
+            row.setdefault('warnings', []).append({'code': 'non_url_reference',
+                'message': 'Upstream reference retained as inert text; not a download URL.',
+                'reference_index': len(row['references']) - 1})
+        else:
+            row['references'].append({'url': url})
     return row
 
 
@@ -558,25 +610,48 @@ class Run:
             start = timestamp(self.now) - timedelta(days=self.policy.get('retention_days', 30))
             if self.old.get('completed_watermark'):
                 start = max(start, timestamp(self.old['completed_watermark']) - timedelta(hours=self.policy.get('overlap_hours', 48)))
-            self.cursor = {'start': iso(start), 'end': self.now, 'phase': 0, 'page': 1, 'offset': 0}
+            self.cursor = {'start': iso(start), 'end': self.now, 'phase': 0, 'offset': 0,
+                           'pagination': 'github-link-v1'}
+        elif self.cursor.get('pagination') != 'github-link-v1':
+            # Numeric page was never a supported global-advisory API cursor.
+            # Replay the same complete window; already stored records deduplicate.
+            self.cursor = {'start': self.cursor['start'], 'end': self.cursor['end'],
+                           'phase': 0, 'offset': 0, 'pagination': 'github-link-v1'}
+            self.state['pagination_recovery'] = 'legacy numeric page checkpoint replayed within its original window'
+        self.result.revision = self.cursor['end']
         phases = ('published', 'updated')
         while self.cursor['phase'] < 2:
             field = phases[self.cursor['phase']]
-            params = urlencode({'type': 'reviewed', field: f'{self.cursor["start"]}..{self.cursor["end"]}',
-                'sort': field, 'direction': 'asc', 'per_page': 100, 'page': self.cursor['page']})
-            page = self.http.get_json(f'https://api.github.com/advisories?{params}')
+            filters = {'type': 'reviewed', field: f'{self.cursor["start"]}..{self.cursor["end"]}',
+                       'sort': field, 'direction': 'asc', 'per_page': '100'}
+            url = advisory_page_url(self.cursor.get('current_url') or
+                                    'https://api.github.com/advisories?' + urlencode(filters), filters)
+            self.cursor['current_url'] = url
+            page = self.http.get_json(url)
             if not isinstance(page, list):
                 raise ValueError('invalid GHSA page')
+            next_url = advisory_next_url(getattr(self.http, 'last_headers', {}), filters)
+            visited = self.cursor.setdefault('visited_pages', [])
+            current_hash = hashlib.sha256(url.encode()).hexdigest()
+            if next_url and (not page or hashlib.sha256(next_url.encode()).hexdigest() in visited + [current_hash]):
+                raise ValueError('GHSA pagination next cursor did not advance')
+            page_hash = hashlib.sha256(canonical(page)).hexdigest()
+            if self.cursor.get('page_hash') != page_hash:
+                self.cursor['offset'] = 0
+            self.cursor['page_hash'] = page_hash
             for raw in page[self.cursor['offset']:]:
                 self.unit()
                 self.add(normalize_ghsa(raw))
                 self.cursor['offset'] += 1
             self.cursor['offset'] = 0
-            if len(page) < 100:
+            self.cursor.pop('page_hash')
+            if next_url is None:
                 self.cursor['phase'] += 1
-                self.cursor['page'] = 1
+                self.cursor.pop('current_url')
+                self.cursor['visited_pages'] = []
             else:
-                self.cursor['page'] += 1
+                visited.append(current_hash)
+                self.cursor['current_url'] = next_url
         # A review-state change can remove an entry from reviewed listings.
         if self.old.get('reconciled_on') != self.now[:10]:
             retained = sorted({row['native_id'] for row in self.previous})
@@ -623,6 +698,10 @@ class Run:
     def poc(self):
         intel_sha, intel = self.intel()
         revision = self.pinned(REPOS['poc-in-github'])
+        if (not self.old.get('continuation') and self.old.get('status') == 'ok' and
+                revision == self.old.get('revision') and intel_sha == self.old.get('intel_commit_sha')):
+            self.finish(revision, watermark=self.old.get('completed_watermark'))
+            return
         active = sorted({a for x in intel for a in x.get('aliases', []) if CVE.fullmatch(a)})
         self.active_poc_aliases = set(active)
         for index in range(self.cursor.get('offset', 0), len(active)):
@@ -644,6 +723,7 @@ class Run:
                 self.add(row)
             self.cursor['offset'] = index + 1
         self.state['intel_commit_sha'] = intel_sha
+        self.state['active_ids'] = active
         # Per-unit prior records are reconciled by their intel aliases; no broad
         # deletion is inferred from a missing upstream file.
         self.finish(revision)

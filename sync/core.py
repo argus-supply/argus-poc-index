@@ -63,6 +63,8 @@ def load_policy(path):
     allocations = policy['runner_minutes_by_repository']
     if any(type(value) is not int or value <= 0 for value in allocations.values()) or sum(allocations.values()) > policy['monthly_runner_minutes']:
         raise ValueError('invalid per-repository runner allocation')
+    if len(policy['source_order']) != len(set(policy['source_order'])):
+        raise ValueError('duplicate source in fair collection order')
     return policy
 
 

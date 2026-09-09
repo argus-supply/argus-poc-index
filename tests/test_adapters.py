@@ -3,7 +3,7 @@ import copy
 import hashlib
 import json
 import unittest
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from sync.adapters import (CVE, collect, cve_path, normalize_cve, normalize_ghsa,
                            normalize_kev, normalize_template, raw_url)
@@ -44,13 +44,16 @@ class HTTP:
     def __init__(self, handler):
         self.handler = handler
         self.urls = []
+        self.last_headers = {}
 
     def get_json(self, url, headers=None):
         self.urls.append(url)
+        self.last_headers = {}
         return self.handler(url)
 
     def get_bytes(self, url, headers=None):
         self.urls.append(url)
+        self.last_headers = {}
         return self.handler(url)
 
 
@@ -276,14 +279,20 @@ class SourceContracts(unittest.TestCase):
         self.assertEqual(result.records[0]['status'], 'source_deleted')
 
     def test_ghsa_full_pagination_equal_timestamps_overlap_and_resume(self):
+        alphabet = '23456789cfghjmpqrvwx'
+        rows = [ghsa('GHSA-2345-6789-22' + alphabet[i // len(alphabet)] + alphabet[i % len(alphabet)]) for i in range(101)]
         def handler(url):
             params = parse_qs(urlsplit(url).query)
             if params:
                 self.assertEqual(params['type'], ['reviewed'])
-                if params['page'] == ['1']:
-                    return [ghsa() for _ in range(100)]
-                return [ghsa('GHSA-6789-cfgh-jmpq')]
-            return ghsa()
+                self.assertNotIn('page', params)
+                if 'after' not in params:
+                    query = {key: values[0] for key, values in params.items()}
+                    query['after'] = 'Y3Vyc29yOm5leHQ='
+                    http.last_headers = {'Link': '<https://api.github.com/advisories?' + urlencode(query) + '>; rel="next"'}
+                    return rows[:100]
+                return rows[100:]
+            return next(row for row in rows if url.endswith(row['ghsa_id']))
         http = HTTP(handler)
         first = collect('ghsa', http, {}, now=NOW, policy={'adapter_max_units': 50})
         self.assertEqual(first.status, 'partial')
@@ -292,9 +301,106 @@ class SourceContracts(unittest.TestCase):
         second = collect('ghsa', http, {'records': first.records, 'state': first.state}, now=NOW,
                          policy={'adapter_max_units': 300})
         self.assertEqual(second.status, 'ok')
-        self.assertEqual({x['native_id'] for x in second.records}, {GHSA_ID, 'GHSA-6789-cfgh-jmpq'})
+        self.assertEqual({x['native_id'] for x in second.records}, {row['ghsa_id'] for row in rows})
         self.assertTrue(any('published=' in u for u in http.urls))
         self.assertTrue(any('updated=' in u for u in http.urls))
+        self.assertTrue(any('after=' in u for u in http.urls))
+
+    def test_ghsa_link_advances_short_pages_and_finishes_full_terminal_page(self):
+        def handler(url):
+            params = parse_qs(urlsplit(url).query)
+            if 'updated' in params:
+                return []
+            if 'after' not in params:
+                query = {key: values[0] for key, values in params.items()}
+                query['after'] = 'opaque-next'
+                http.last_headers = {'link': '<https://api.github.com/advisories?' + urlencode(query) + '>; rel="next"'}
+                return [ghsa()]
+            return [ghsa('GHSA-6789-cfgh-jmpq')] * 100
+        http = HTTP(handler)
+        result = collect('ghsa', http, {}, now=NOW, policy={})
+        self.assertEqual(result.status, 'ok')
+        self.assertEqual({r['native_id'] for r in result.records}, {GHSA_ID, 'GHSA-6789-cfgh-jmpq'})
+        self.assertEqual(len(http.urls), 3)
+
+    def test_ghsa_legacy_numeric_checkpoint_replays_original_window(self):
+        previous = {'state': {'continuation': {'start': '2026-08-10T00:00:00Z',
+            'end': NOW, 'phase': 1, 'page': 5, 'offset': 93}}}
+        http = HTTP(lambda url: [ghsa()])
+        result = collect('ghsa', http, previous, now='2026-09-10T00:00:00Z', policy={})
+        self.assertEqual(result.status, 'ok')
+        self.assertEqual(result.completed_watermark, NOW)
+        self.assertEqual(parse_qs(urlsplit(http.urls[0]).query)['published'], ['2026-08-10T00:00:00Z..' + NOW])
+        self.assertIn('legacy numeric', result.state['pagination_recovery'])
+        self.assertEqual(len(result.records), 1)
+
+    def test_ghsa_next_links_cannot_change_origin_path_filters_or_add_parameters(self):
+        cases = ('foreign', 'path', 'filter', 'duplicate', 'numeric-page', 'two-cursors', 'userinfo', 'empty-cursor')
+        for case in cases:
+            def handler(url):
+                params = {key: values[0] for key, values in parse_qs(urlsplit(url).query).items()}
+                params['after'] = 'cursor'
+                if case == 'filter':
+                    params['type'] = 'unreviewed'
+                if case == 'numeric-page':
+                    params['page'] = '2'
+                if case == 'two-cursors':
+                    params['before'] = 'another'
+                if case == 'empty-cursor':
+                    params['after'] = ''
+                target = 'https://api.github.com/advisories?' + urlencode(params)
+                if case == 'foreign':
+                    target = target.replace('api.github.com', 'example.com')
+                if case == 'path':
+                    target = target.replace('/advisories?', '/user?')
+                if case == 'duplicate':
+                    target += '&type=reviewed'
+                if case == 'userinfo':
+                    target = target.replace('https://', 'https://user@')
+                http.last_headers = {'Link': '<' + target + '>; rel="next"'}
+                return [ghsa()]
+            http = HTTP(handler)
+            result = collect('ghsa', http, {}, now=NOW, policy={})
+            with self.subTest(case=case):
+                self.assertEqual(result.status, 'partial')
+                self.assertIsNone(result.completed_watermark)
+                self.assertEqual(len(http.urls), 1)
+                self.assertTrue(result.errors)
+
+    def test_ghsa_link_cycle_cannot_advance_watermark(self):
+        first_url = None
+        def handler(url):
+            nonlocal first_url
+            if first_url is None:
+                first_url = url
+                next_url = url + '&after=next'
+            else:
+                next_url = first_url
+            http.last_headers = {'Link': '<' + next_url + '>; rel="next"'}
+            return [ghsa()]
+        http = HTTP(handler)
+        result = collect('ghsa', http, {}, now=NOW, policy={})
+        self.assertEqual(result.status, 'partial')
+        self.assertIsNone(result.completed_watermark)
+        self.assertIn('did not advance', result.errors[0]['message'])
+
+    def test_ghsa_changed_page_replays_instead_of_skipping_by_old_offset(self):
+        rows = [ghsa(), ghsa('GHSA-6789-cfgh-jmpq')]
+        phase = 0
+        def handler(url):
+            if '/advisories/GHSA-' in url:
+                return rows[0]
+            params = parse_qs(urlsplit(url).query)
+            if 'updated' in params:
+                return []
+            return rows if phase == 0 else rows[1:]
+        http = HTTP(handler)
+        first = collect('ghsa', http, {}, now=NOW, policy={'adapter_max_units': 1})
+        self.assertEqual(first.continuation['offset'], 1)
+        phase = 1
+        second = collect('ghsa', http, {'records': first.records, 'state': first.state}, now=NOW, policy={})
+        self.assertEqual(second.status, 'ok')
+        self.assertIn('GHSA-6789-cfgh-jmpq', {row['native_id'] for row in second.records})
 
     def test_ghsa_retained_direct_reconciliation_detects_review_removal(self):
         removed = ghsa()
@@ -347,6 +453,27 @@ class SourceContracts(unittest.TestCase):
         self.assertEqual(last.status, 'ok')
         self.assertEqual(last.records[0]['advisory_ids'], ['CVE-2020-1234', 'CVE-2020-1235'])
 
+    def test_poc_same_completed_source_and_intel_revisions_do_not_rescan_active_files(self):
+        dep = dependency([normalize_cve(cve(), REV)])
+        http = HTTP(lambda url: {'sha': REV} if '/commits/HEAD' in url else self.fail('unchanged active files refetched'))
+        previous = {'state': {'status': 'ok', 'revision': REV, 'intel_commit_sha': REV,
+            'completed_watermark': NOW, 'active_ids': ['CVE-2020-1234']}}
+        result = collect('poc-in-github', http, previous, now='2026-09-10T00:00:00Z', policy={}, dependency=dep)
+        self.assertEqual(result.status, 'ok')
+        self.assertEqual(result.records, [])
+        self.assertEqual(result.completed_watermark, NOW)
+        self.assertEqual(len(http.urls), 1)
+
+    def test_poc_changed_intel_revision_cannot_take_the_no_change_shortcut(self):
+        dep = dependency([normalize_cve(cve(), REV)])
+        http = HTTP(lambda url: {'sha': REV} if '/commits/HEAD' in url else [])
+        previous = {'state': {'status': 'ok', 'revision': REV, 'intel_commit_sha': OLDER,
+            'completed_watermark': NOW}}
+        result = collect('poc-in-github', http, previous, now=NOW, policy={}, dependency=dep)
+        self.assertEqual(result.status, 'ok')
+        self.assertEqual(len(http.urls), 2)
+        self.assertEqual(result.state['active_ids'], ['CVE-2020-1234'])
+
     def test_exploitdb_retains_recent_non_cve_reference_without_invented_link(self):
         csv_data = b'id,description,codes,date_published\n1,Recent reference,,2026-09-08\n2,Old irrelevant,,2000-01-01\n'
         http = HTTP(lambda u: [{'id': REV}] if '/commits?' in u else csv_data)
@@ -380,6 +507,36 @@ class SourceContracts(unittest.TestCase):
         self.assertEqual(row['requirements']['authentication'], 'required')
         self.assertIsNone(row['engine']['minimum_version'])
         self.assertFalse(row['verification']['executed'])
+
+    def test_non_url_template_references_are_inert_text_with_warnings(self):
+        references = ['https://example.com/advisory', 'Vendor advisory DOC-123',
+                      'javascript:alert(1)', 'file:///etc/passwd', 'https://user:password@example.com/private', 42]
+        data = self.template().replace(b'  tags:', ('  reference: ' + json.dumps(references) + '\n  tags:').encode())
+        row = self.template_row(data)
+        self.assertEqual(row['references'][0], {'url': references[0]})
+        self.assertEqual([item['text'] for item in row['references'][1:]], [str(value) for value in references[1:]])
+        self.assertTrue(all(item['retrievable'] is False and 'url' not in item for item in row['references'][1:]))
+        self.assertEqual([warning['reference_index'] for warning in row['warnings']], [1, 2, 3, 4, 5])
+
+    def test_non_url_reference_does_not_stop_later_templates_or_trigger_fetch(self):
+        data = self.template().replace(b'  tags:', b'  reference: ["Vendor DOC-123"]\n  tags:')
+        blob = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+        paths = ['http/one.yaml', 'http/two.yaml']
+        tree = {'truncated': False, 'tree': [{'type': 'blob', 'mode': '100644', 'path': path,
+            'sha': blob, 'size': len(data)} for path in paths]}
+        def handler(url):
+            if '/commits/' in url:
+                return {'sha': REV}
+            if '/git/trees/' in url:
+                return tree
+            self.assertIn(url, [raw_url('projectdiscovery/nuclei-templates', REV, path) for path in paths])
+            return data
+        http = HTTP(handler)
+        result = collect('nuclei', http, {}, now=NOW, policy={})
+        self.assertEqual(result.status, 'ok')
+        self.assertEqual(len(result.records), 2)
+        self.assertTrue(all(row['warnings'][0]['code'] == 'non_url_reference' for row in result.records))
+        self.assertEqual(len(http.urls), 4)
 
     def test_unsafe_yaml_duplicate_alias_and_python_tags_rejected(self):
         for data in (b'id: one\nid: two\ninfo: {}', b'id: &a thing\ninfo: *a',

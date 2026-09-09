@@ -28,6 +28,7 @@ def run(repository, remote, work, job_id, *, policy, token=None, manual=False, h
     records, events, sources, previous = read_snapshot(before_files)
     registry = json.loads((ROOT / 'sources.json').read_text())
     enabled = [item for item in registry['sources'] if item['repository'].split('/')[-1] == repository]
+    enabled.sort(key=lambda item: policy['source_order'].index(item['id']))
     bootstrap = not previous or any(not sources.get(item['id'], {}).get('completed_watermark') for item in enabled)
     ledger = Ledger(store, policy)
     metrics = {'schema_version': '1.0', 'repository': 'argus-supply/' + repository,

@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "policy_version": "2026-09-09.1",
+  "policy_version": "2026-09-09.2",
   "retention_days": 30,
   "event_days": 30,
   "bootstrap_days": 7,
@@ -23,6 +23,7 @@
     "argus-poc-index": 180,
     "argus-detection-resources": 180
   },
+  "source_order": ["kev", "ghsa", "cve", "official-references", "exploitdb", "poc-in-github", "nuclei"],
   "max_pocs_per_vulnerability": 100,
   "http_timeout_seconds": 25,
   "http_retries": 2,
