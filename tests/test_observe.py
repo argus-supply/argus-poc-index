@@ -250,6 +250,90 @@ class SamplingTests(unittest.TestCase):
                 self.assertIn('error', result)
                 self.assertNotIn(secret, json.dumps(result))
 
+    def test_http_headers_expose_only_numeric_rejection_evidence(self):
+        for status in (403, 429):
+            with self.subTest(status=status):
+                output = (f'HTTP/2.0 {status} Forbidden\r\nRetry-After: 60\r\n'
+                    'X-Ratelimit-Remaining: 0\r\nX-Ratelimit-Reset: 1788912060\r\n'
+                    'Secret-Header: private-token-marker\r\n\r\n{"message":"private-token-marker"}')
+                with patch.object(observe.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                        ['gh'], 1, stdout=output, stderr='private-token-marker')):
+                    result = observe.api('unused')
+                self.assertEqual(result['http_status'], status)
+                self.assertEqual(result['retry_after_seconds'], 60)
+                self.assertEqual(result['rate_limit_remaining'], 0)
+                self.assertEqual(result['rate_limit_reset'], 1788912060)
+                self.assertNotIn('private-token-marker', json.dumps(result))
+
+    def test_api_parses_success_headers_and_rejects_oversized_or_invalid_envelopes(self):
+        for body, valid in (('{"total_count":0,"workflow_runs":[]}', True), ('[]', False), ('secret', False)):
+            with self.subTest(body=body), patch.object(observe.subprocess, 'run',
+                    return_value=subprocess.CompletedProcess(['gh'], 0, stdout='HTTP/2.0 200 OK\n\n' + body)):
+                self.assertEqual('error' not in observe.api('unused'), valid)
+        with patch.object(observe, 'API_RESPONSE_BYTES', 20), patch.object(observe.subprocess, 'run',
+                return_value=subprocess.CompletedProcess(['gh'], 0, stdout='x' * 21)):
+            self.assertIn('safety limit', observe.api('unused')['error'])
+
+    def test_actual_rejection_waits_for_primary_reset_or_secondary_retry_delay(self):
+        for headers, expected in (('X-Ratelimit-Remaining: 0\nX-Ratelimit-Reset: 9000', 9000),
+                ('Retry-After: 120', 1121), ('', 1061)):
+            with self.subTest(headers=headers), patch.object(observe.time, 'time', return_value=1000), \
+                    patch.object(observe.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                        ['gh'], 1, stdout='HTTP/2.0 429 Too Many Requests\n' + headers + '\n\n{}')):
+                self.assertEqual(observe.api('unused')['retry_not_before'], expected)
+
+    def test_later_page_failure_invalidates_the_qualified_window(self):
+        rows = [run(identifier, seconds=1, conclusion='failure' if identifier == 150 else 'success')
+                for identifier in range(1, 151)]
+        with tempfile.TemporaryDirectory() as directory, patch.object(observe, 'read_index', return_value=healthy()['index']):
+            with patch.object(observe, 'api', side_effect=self.api):
+                observe.sample(directory, start_qualified_window=True, now=START)
+
+            def pages(path):
+                return paginated_runs(rows, path) if '/runs?' in path else self.api(path)
+
+            with patch.object(observe, 'api', side_effect=pages):
+                result = observe.sample(directory, now=START + dt.timedelta(seconds=900))
+        self.assertEqual(result['status'], 'qualified_window_invalidated')
+        for name, repository in result['repositories'].items():
+            self.assertTrue(repository['window_listing_complete'])
+            self.assertEqual(len(repository['runs']), 150)
+            self.assertIn(name + ':failed_run:150', result['qualification_checks']['problems'])
+
+    def test_rate_rejection_stops_all_later_github_requests_and_retains_partial_evidence(self):
+        rows = [run(identifier, seconds=1) for identifier in range(1, 151)]
+
+        def limited(path):
+            page = int(parse_qs(urlsplit(path).query)['page'][0])
+            if page == 2:
+                return {'error': 'GitHub API request rejected or invalid', 'http_status': 429, 'retry_after_seconds': 60}
+            return paginated_runs(rows, path)
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(observe, 'read_index', return_value=healthy()['index']), \
+                patch.object(observe, 'api', side_effect=limited) as api:
+            result = observe.sample(directory, now=START + dt.timedelta(seconds=900))
+        self.assertEqual(api.call_count, 2)
+        repositories = list(result['repositories'].values())
+        self.assertEqual([len(item['runs']) for item in repositories], [100, 0, 0])
+        self.assertTrue(all(not item['window_listing_complete'] for item in repositories))
+        self.assertTrue(all(item['github_api_rejection']['retry_after_seconds'] == 60 for item in repositories))
+
+    def test_upstream_retry_time_survives_next_sample_and_requests_resume_afterward(self):
+        limited = {'error': 'GitHub API request rejected or invalid', 'http_status': 429,
+                   'retry_not_before': int((START + dt.timedelta(seconds=1800)).timestamp())}
+        with tempfile.TemporaryDirectory() as directory, patch.object(observe, 'read_index', return_value=healthy()['index']):
+            with patch.object(observe, 'api', return_value=limited) as api:
+                observe.sample(directory, now=START + dt.timedelta(seconds=900))
+                api.assert_called_once()
+            with patch.object(observe, 'api') as api:
+                result = observe.sample(directory, now=START + dt.timedelta(seconds=1799))
+                api.assert_not_called()
+            self.assertTrue(all(not repo['window_listing_complete'] for repo in result['repositories'].values()))
+            with patch.object(observe, 'api', side_effect=self.api) as api:
+                result = observe.sample(directory, now=START + dt.timedelta(seconds=1800))
+                self.assertEqual(api.call_count, 12)
+            self.assertTrue(all(repo['window_listing_complete'] for repo in result['repositories'].values()))
+
     def test_index_auth_is_loopback_only_proxy_free_and_not_written_to_evidence(self):
         token = 'private-token-marker'
         opener = MagicMock()
@@ -277,6 +361,61 @@ class SamplingTests(unittest.TestCase):
                 with patch.object(observe.urllib.request, 'build_opener', return_value=opener):
                     result = observe.read_index()
                 self.assertEqual(result, {'error': 'index status unavailable or invalid'})
+
+
+def paginated_runs(rows, path):
+    query = parse_qs(urlsplit(path).query)
+    lower, upper = map(observe.instant, query['created'][0].split('..'))
+    selected = [row for row in rows if lower <= observe.instant(row['created_at']) <= upper]
+    page, per_page = int(query['page'][0]), int(query['per_page'][0])
+    return {'total_count': len(selected), 'workflow_runs': selected[(page - 1) * per_page:page * per_page]}
+
+
+class WorkflowRunPaginationTests(unittest.TestCase):
+    def test_complete_window_larger_than_thirty_runs_uses_all_pages(self):
+        rows = [run(identifier, seconds=identifier) for identifier in range(1, 252)]
+        with patch.object(observe, 'api', side_effect=lambda path: paginated_runs(rows, path)) as api:
+            result = observe.workflow_runs('repos/argus-supply/argus-intel-data', timestamp(), timestamp(900))
+        self.assertTrue(result['listing_complete'])
+        self.assertEqual(result['workflow_runs'], rows)
+        self.assertEqual(api.call_count, 3)
+        queries = [parse_qs(urlsplit(call.args[0]).query) for call in api.call_args_list]
+        self.assertEqual([query['page'] for query in queries], [['1'], ['2'], ['3']])
+        self.assertTrue(all(query['per_page'] == ['100'] for query in queries))
+
+    def test_official_search_limit_splits_adjacent_seconds_without_losing_boundary_runs(self):
+        rows = [run(identifier, seconds=identifier % 2) for identifier in range(1, 1102)]
+        with patch.object(observe, 'api', side_effect=lambda path: paginated_runs(rows, path)):
+            result = observe.workflow_runs('repos/argus-supply/argus-intel-data', timestamp(), timestamp(1))
+        self.assertTrue(result['listing_complete'])
+        self.assertEqual({row['id'] for row in result['workflow_runs']}, set(range(1, 1102)))
+        self.assertEqual(result['listing_windows'], 3)
+        self.assertEqual(result['total_count'], 1101)
+
+    def test_unsplittable_official_limit_is_incomplete(self):
+        with patch.object(observe, 'api', return_value={'total_count': 1000, 'workflow_runs': []}) as api:
+            result = observe.workflow_runs('repos/argus-supply/argus-intel-data', timestamp(), timestamp())
+        self.assertFalse(result['listing_complete'])
+        self.assertIn('GitHub filtered run limit', result['error'])
+        api.assert_called_once()
+
+    def test_malformed_short_duplicate_changing_or_failed_pages_are_incomplete(self):
+        first = {'total_count': 101, 'workflow_runs': [run(identifier) for identifier in range(1, 101)]}
+        cases = (
+            {'total_count': 101, 'workflow_runs': []},
+            {'total_count': 101, 'workflow_runs': [run()]},
+            {'total_count': 102, 'workflow_runs': [run(101), run(102)]},
+            {'total_count': 101, 'workflow_runs': [None]},
+            {'total_count': 101, 'workflow_runs': [run(101, seconds=901)]},
+            {'total_count': True, 'workflow_runs': [run(101)]},
+            {'total_count': 101, 'workflow_runs': None},
+            {'error': 'GitHub API unavailable or invalid'},
+        )
+        for last in cases:
+            with self.subTest(last=last), patch.object(observe, 'api', side_effect=[copy.deepcopy(first), last]):
+                result = observe.workflow_runs('repos/argus-supply/argus-intel-data', timestamp(), timestamp(900))
+            self.assertFalse(result['listing_complete'])
+            self.assertEqual(len(result['workflow_runs']), 100)
 
 
 if __name__ == '__main__':

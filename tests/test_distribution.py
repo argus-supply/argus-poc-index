@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 from sync.core import ROOT, canonical, digest, load_policy, read_snapshot, apply_result, build_snapshot
 from sync.adapters import AdapterResult
-from sync.dependency import consume_intel
+from sync.dependency import consume_intel, read_manifest
 from sync.gitstore import GitStore, Ledger
 from sync.http import BudgetExceeded, Http
 from sync.run import run
@@ -145,6 +145,20 @@ class DependencyTests(unittest.TestCase):
                 sources[name].update(changes)
         return build_snapshot('argus-supply/argus-intel-data', {}, {}, sources,
             policy, '2026-09-09T00:00:00Z', 'fixture')[0]
+
+    def test_large_dependency_manifest_retains_fixed_hash_and_full_source_state(self):
+        manifest = json.loads(self.intel_files()['manifest.json'])
+        manifest['sources']['cve']['continuation_history'] = 'x' * 524288
+        body = canonical(manifest)
+        class Remote:
+            def get_bytes(self, url):
+                return body
+        with self.assertLogs('sync.observations', level='WARNING'):
+            received, parsed = read_manifest(Remote(), 'argus-supply/argus-intel-data', 'a' * 40, digest(body))
+        self.assertEqual(received, body)
+        self.assertEqual(parsed, manifest)
+        with self.assertRaisesRegex(ValueError, 'fixed-revision hash'):
+            read_manifest(Remote(), 'argus-supply/argus-intel-data', 'a' * 40, 'b' * 64)
 
     def test_dependency_coverage_requires_every_fixed_source_watermark_and_no_gaps(self):
         for override in ({}, {'cve': {'status': 'partial'}}, {'ghsa': {'completed_watermark': None}},
@@ -310,13 +324,19 @@ class PocDependencyRunnerTests(unittest.TestCase):
         self.assertFalse(intent['baseline_complete'])
         self.assertEqual(intent['baseline_gate_version'], 2)
         self.assertEqual(intent['dependency_coverage'], result['dependency_coverage'])
-        # Own source watermarks completed: partial dependency must not grant a
-        # second HTTP initialization allowance in the same UTC day.
+        # Own source watermarks completed: the next HTTP run remains steady,
+        # records its cost, and may exceed the advisory daily target.
         self.policy['daily_bytes'] = result['upstream_bytes']
-        denied = self.run_with_dependency(False, 'no-new-http')
-        self.assertFalse(denied['bootstrap'])
-        self.assertFalse(denied['published'])
-        self.assertIn('daily byte budget exhausted', denied['error'])
+        continued = self.run_with_dependency(False, 'continued-http')
+        self.assertFalse(continued['bootstrap'])
+        self.assertFalse(continued['published'])
+        self.assertEqual(continued['status'], 'partial')
+        self.assertNotIn('error', continued)
+        _, control = consumer.read('control')
+        persisted = json.loads(control['ledger.json'])
+        self.assertEqual(persisted['reservations']['partial']['charged_bytes'], result['upstream_bytes'])
+        self.assertEqual(persisted['reservations']['continued-http']['charged_bytes'], continued['upstream_bytes'])
+        self.assertTrue(persisted['capacity_observations'][0]['exceeded'])
 
     def test_complete_intel_and_own_sources_allow_gate_and_exact_noop_proof(self):
         first = self.run_with_dependency(True, 'complete')

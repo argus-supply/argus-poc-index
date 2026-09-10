@@ -11,7 +11,9 @@ concurrency:
 jobs:
   synchronize:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    # GitHub-hosted jobs have a six-hour execution limit. Leave ten minutes
+    # for setup, tests, publication settlement and artifact upload.
+    timeout-minutes: 360
     permissions:
       contents: write
     steps:
@@ -27,7 +29,7 @@ jobs:
       - name: Collect and atomically publish
         env:
           GH_TOKEN: ${{ github.token }}
-          ARGUS_COLLECT_SECONDS: '480'
+          ARGUS_COLLECT_SECONDS: '21000'
         run: python -m sync.run --repository argus-poc-index ${{ github.event_name == 'workflow_dispatch' && '--manual' || '' }}
       - name: Retain bounded diagnostic evidence
         if: always()

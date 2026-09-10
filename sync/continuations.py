@@ -410,14 +410,19 @@ def join_record(parent: dict, records_by_id: Mapping[str, dict], *,
     return logical
 
 
-def assemble_records(records: Iterable[dict] | Mapping[str, dict], *,
-                     max_record_bytes=MAX_RECORD_BYTES,
-                     max_logical_bytes=MAX_LOGICAL_BYTES,
-                     max_snapshot_logical_bytes=MAX_SNAPSHOT_LOGICAL_BYTES) -> list[dict]:
-    """Reassemble an entire snapshot, rejecting duplicate or orphan fragments."""
+def iter_records(records: Iterable[dict] | Mapping[str, dict], *,
+                 max_record_bytes=MAX_RECORD_BYTES,
+                 max_logical_bytes=MAX_LOGICAL_BYTES,
+                 max_snapshot_logical_bytes=MAX_SNAPSHOT_LOGICAL_BYTES) -> Iterable[dict]:
+    """Yield logical rows with bounded per-record expansion.
+
+    Consumers must exhaust the iterator before committing results: orphan
+    fragments are checked at completion. ``None`` disables the optional whole
+    snapshot capacity threshold without weakening any individual record checks.
+    """
     _bounds(max_record_bytes, max_logical_bytes)
-    if (type(max_snapshot_logical_bytes) is not int or max_snapshot_logical_bytes <= 0
-            or max_snapshot_logical_bytes > MAX_SNAPSHOT_LOGICAL_BYTES):
+    if (max_snapshot_logical_bytes is not None and
+            (type(max_snapshot_logical_bytes) is not int or max_snapshot_logical_bytes <= 0)):
         raise ValueError('invalid snapshot logical byte ceiling')
     values = records.values() if isinstance(records, Mapping) else records
     by_id = {}
@@ -428,21 +433,30 @@ def assemble_records(records: Iterable[dict] | Mapping[str, dict], *,
         by_id[identifier] = record
     if isinstance(records, Mapping) and set(records) != set(by_id):
         raise ValueError('physical record map key mismatch')
-    logical, claimed, logical_bytes = [], set(), 0
+    claimed, logical_bytes = set(), 0
     for identifier, parent in sorted(by_id.items()):
         if parent.get('kind') == 'continuation':
             continue
         row = join_record(parent, by_id, max_record_bytes=max_record_bytes,
                           max_logical_bytes=max_logical_bytes)
         logical_bytes += len(_canonical(row))
-        if logical_bytes > max_snapshot_logical_bytes:
+        if max_snapshot_logical_bytes is not None and logical_bytes > max_snapshot_logical_bytes:
             raise ValueError('snapshot logical records exceed byte ceiling')
         for part_id in parent.get('continuation', {}).get('parts', []):
             if part_id in claimed:
                 raise ValueError('continuation fragment claimed by multiple parents')
             claimed.add(part_id)
-        logical.append(row)
+        yield row
     fragments = {key for key, value in by_id.items() if value.get('kind') == 'continuation'}
     if fragments != claimed:
         raise ValueError('orphan or foreign continuation fragment')
-    return logical
+
+
+def assemble_records(records: Iterable[dict] | Mapping[str, dict], *,
+                     max_record_bytes=MAX_RECORD_BYTES,
+                     max_logical_bytes=MAX_LOGICAL_BYTES,
+                     max_snapshot_logical_bytes=MAX_SNAPSHOT_LOGICAL_BYTES) -> list[dict]:
+    """Fully validate and materialize a snapshot before returning any results."""
+    return list(iter_records(records, max_record_bytes=max_record_bytes,
+        max_logical_bytes=max_logical_bytes,
+        max_snapshot_logical_bytes=max_snapshot_logical_bytes))

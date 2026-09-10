@@ -5,6 +5,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import time
 import urllib.parse
@@ -15,6 +16,13 @@ REPOS = ('argus-intel-data', 'argus-poc-index', 'argus-detection-resources')
 SOURCES = dict(zip(REPOS, (('cve', 'ghsa', 'kev'),
     ('official-references', 'exploitdb', 'poc-in-github'), ('nuclei',))))
 WINDOW_SECONDS = 24 * 3600
+# GitHub documents 100 results/page and 1,000 results per filtered search:
+# https://docs.github.com/en/rest/actions/workflow-runs#list-workflow-runs-for-a-workflow
+RUNS_PER_PAGE = 100
+FILTERED_RUN_LIMIT = 1000
+API_RESPONSE_BYTES = 16 * 1024 * 1024
+REJECTION_FIELDS = ('http_status', 'retry_after_seconds', 'rate_limit_remaining',
+    'rate_limit_reset', 'retry_not_before')
 
 
 def instant(value):
@@ -27,14 +35,100 @@ def instant(value):
 
 
 def api(path):
+    """Read one page; report actual HTTP rejection without echoing upstream text.
+
+    No retry follows a 403/429. The caller defers the sample, including all
+    remaining repository requests, instead of spending through upstream limits.
+    """
     try:
-        result = subprocess.run(['gh', 'api', path], capture_output=True, text=True, timeout=45)
-        if result.returncode:
-            return {'error': 'GitHub API request failed', 'exit_code': result.returncode}
-        value = json.loads(result.stdout)
+        result = subprocess.run(['gh', 'api', '--include', path], capture_output=True, text=True, timeout=45)
+        if len(result.stdout.encode()) > API_RESPONSE_BYTES:
+            return {'error': 'GitHub API response exceeds individual JSON safety limit'}
+        head, separator, body = result.stdout.replace('\r\n', '\n').partition('\n\n')
+        status = re.match(r'^HTTP/\S+ (\d{3})(?:\s|$)', head)
+        metadata = {}
+        if status and separator:
+            metadata['http_status'] = int(status[1])
+            headers = dict(line.lower().split(':', 1) for line in head.splitlines()[1:] if ':' in line)
+            for header, key in (('retry-after', 'retry_after_seconds'),
+                    ('x-ratelimit-remaining', 'rate_limit_remaining'), ('x-ratelimit-reset', 'rate_limit_reset')):
+                value = headers.get(header, '').strip()
+                if re.fullmatch(r'\d{1,12}', value):
+                    metadata[key] = int(value)
+        if result.returncode or not status or not separator or not 200 <= metadata['http_status'] < 300:
+            if metadata.get('http_status') in (403, 429):
+                # GitHub requires at least a minute after secondary throttling
+                # without Retry-After, or waiting for primary quota reset.
+                retry_at = int(time.time()) + 1 + max(60, metadata.get('retry_after_seconds', 0))
+                if metadata.get('rate_limit_remaining') == 0:
+                    retry_at = max(retry_at, metadata.get('rate_limit_reset', 0))
+                metadata['retry_not_before'] = retry_at
+            return {'error': 'GitHub API request rejected or invalid', 'exit_code': result.returncode, **metadata}
+        value = json.loads(body)
         return value if isinstance(value, dict) else {'error': 'invalid GitHub API envelope'}
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return {'error': 'GitHub API unavailable or invalid'}
+
+
+def workflow_runs(prefix, started, ended):
+    """Enumerate fixed creation windows, splitting at GitHub's search limit.
+
+    Inclusive windows use whole seconds, GitHub's run timestamp precision.
+    Qualification still checks the original exact observation timestamps.
+    Counts must remain stable and every page must be complete and disjoint.
+    """
+    lower, upper = instant(started).replace(microsecond=0), instant(ended).replace(microsecond=0)
+    rows, requests, windows = {}, 0, 0
+
+    def result(error=None, **details):
+        return {'workflow_runs': list(rows.values()), 'total_count': len(rows),
+            'listing_complete': error is None, 'listing_requests': requests,
+            'listing_windows': windows, **({'error': error} if error else {}), **details}
+
+    if lower > upper:
+        return result('invalid workflow run observation interval')
+    pending = [(lower, upper)]
+    while pending:
+        lower, upper = pending.pop()
+        windows += 1
+        page, expected, seen = 1, None, set()
+        while True:
+            params = {'per_page': RUNS_PER_PAGE, 'page': page, 'exclude_pull_requests': 'true',
+                'created': lower.isoformat() + '..' + upper.isoformat()}
+            response = api(prefix + '/actions/workflows/sync.yml/runs?' + urllib.parse.urlencode(params))
+            requests += 1
+            if response.get('error'):
+                return result(response['error'], **{key: response[key] for key in REJECTION_FIELDS if key in response})
+            total, batch = response.get('total_count'), response.get('workflow_runs')
+            if type(total) is not int or total < 0 or not isinstance(batch, list) or len(batch) > RUNS_PER_PAGE:
+                return result('invalid workflow run page envelope')
+            if expected is not None and total != expected:
+                return result('workflow run count changed during pagination')
+            if total >= FILTERED_RUN_LIMIT:
+                if lower == upper:
+                    return result('GitHub filtered run limit reached within one timestamp second')
+                middle = lower + dt.timedelta(seconds=int((upper - lower).total_seconds()) // 2)
+                pending.extend(((middle + dt.timedelta(seconds=1), upper), (lower, middle)))
+                break
+            expected = total
+            if len(batch) != min(RUNS_PER_PAGE, expected - len(seen)):
+                return result('incomplete workflow run page')
+            for row in batch:
+                try:
+                    identifier = row['id']
+                    created = instant(row['created_at'])
+                    if type(identifier) is not int or identifier <= 0 or not lower <= created <= upper:
+                        raise ValueError()
+                except (KeyError, TypeError, ValueError):
+                    return result('invalid or out-of-window workflow run')
+                if identifier in rows:
+                    return result('duplicate workflow run across pages or windows')
+                rows[identifier] = row
+                seen.add(identifier)
+            if len(seen) == expected:
+                break
+            page += 1
+    return result()
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -183,12 +277,19 @@ def sample(directory, *, start_qualified_window=False, interval_seconds=900, now
         legacy = {key: previous.get(key) for key in ('sampled_at', 'observation_started_at', 'elapsed_hours', 'status')}
     if legacy:
         result['legacy_diagnostic'] = legacy
+    # Diagnostics also use a fixed interval; they never imply qualification.
+    listing_start = window_start or (now - dt.timedelta(seconds=WINDOW_SECONDS)).isoformat()
+    blocked = None
+    for repository in mapping(previous.get('repositories')).values():
+        rejection = mapping(mapping(repository).get('github_api_rejection'))
+        retry_at = rejection.get('retry_not_before')
+        if type(retry_at) is int and retry_at > now.timestamp():
+            blocked = {'error': 'GitHub API deferred until upstream retry time',
+                **{key: rejection[key] for key in REJECTION_FIELDS if key in rejection}}
+            break
     for name in REPOS:
         prefix = 'repos/argus-supply/' + name
-        params = {'per_page': 30}
-        if window_start:
-            params['created'] = window_start + '..' + now.isoformat()
-        response = api(prefix + '/actions/workflows/sync.yml/runs?' + urllib.parse.urlencode(params))
+        response = blocked or workflow_runs(prefix, listing_start, now.isoformat())
         raw_runs = response.get('workflow_runs', [])
         if not isinstance(raw_runs, list):
             raw_runs = []
@@ -196,14 +297,23 @@ def sample(directory, *, start_qualified_window=False, interval_seconds=900, now
         runs = [{key: run.get(key) for key in ('id', 'html_url', 'event', 'status', 'conclusion',
                     'created_at', 'updated_at', 'run_started_at', 'head_sha', 'run_attempt')}
                 for run in raw_runs if isinstance(run, dict)]
-        workflow = api(prefix + '/actions/workflows/sync.yml')
-        data = api(prefix + '/git/ref/heads/data')
-        repo = api(prefix)
+        if response.get('http_status') in (403, 429):
+            blocked = {key: response[key] for key in ('error', *REJECTION_FIELDS) if key in response}
+        metadata = []
+        for route in ('/actions/workflows/sync.yml', '/git/ref/heads/data', ''):
+            item = blocked or api(prefix + route)
+            metadata.append(item)
+            if item.get('http_status') in (403, 429):
+                blocked = {key: item[key] for key in ('error', *REJECTION_FIELDS) if key in item}
+        workflow, data, repo = metadata
         errors = [item['error'] for item in (response, workflow, data, repo) if item.get('error')]
         total = response.get('total_count')
         result['repositories'][name] = {'runs': runs, 'data_sha': mapping(data.get('object')).get('sha'),
             'workflow_state': workflow.get('state'), 'workflow_url': workflow.get('html_url'),
-            'window_listing_complete': not errors and type(total) is int and total == len(runs),
+            'window_listing_complete': not errors and response.get('listing_complete') is True and total == len(runs),
+            'run_listing': {'created': listing_start + '..' + now.isoformat(),
+                'requests': response.get('listing_requests', 0), 'windows': response.get('listing_windows', 0)},
+            'github_api_rejection': {key: blocked[key] for key in REJECTION_FIELDS if blocked and key in blocked},
             'reported_repository_kib_all_branches': repo.get('size'),
             'storage_measurement_limit': 'GitHub repository size is a provider estimate, not an exact object inventory',
             'error': '; '.join(errors) if errors else None}

@@ -185,12 +185,13 @@ class ApiStoreTests(unittest.TestCase):
         self.assertEqual(repeated['imported_object_count'], 0)
         self.assertEqual(repeated['pack_bytes'], 0)
 
-    def test_local_batch_import_rejects_object_count_and_corrupt_pack_before_success(self):
+    def test_local_batch_import_warns_on_object_count_but_rejects_corrupt_pack(self):
         candidate = self.api.seed({'file': b'bounded object'})
         with patch('tools.github_api_store.MAX_ENTRIES', 2):
-            with self.assertRaisesRegex(GitHubApiError, 'inventory exceeds bound'):
+            with self.assertLogs('sync.observations', level='WARNING'):
                 self.store.import_local_snapshot(self.api.git.path, candidate)
-        self.assertFalse(self.store._has(candidate, 'commit'))
+        self.assertTrue(self.store._has(candidate, 'commit'))
+        other = GitHubApiStore(self.root / 'corrupt-import.git', self.api.repository, api=self.api)
         original = _Git.run
 
         def corrupt(git, *args, **kwargs):
@@ -201,8 +202,8 @@ class ApiStoreTests(unittest.TestCase):
 
         with patch('tools.github_api_store._Git.run', new=corrupt):
             with self.assertRaisesRegex(GitHubApiError, 'failed or exceeded'):
-                self.store.import_local_snapshot(self.api.git.path, candidate)
-        self.assertFalse(self.store._has(candidate, 'commit'))
+                other.import_local_snapshot(self.api.git.path, candidate)
+        self.assertFalse(other._has(candidate, 'commit'))
         self.assertEqual(self.api.calls, [])
 
     def test_prepared_commits_use_utc_and_ignore_inherited_git_dates(self):
@@ -331,17 +332,35 @@ class ApiStoreTests(unittest.TestCase):
                     store.observe_heads()
                 self.api.mutate = None
 
-    def test_local_import_and_upload_enforce_logical_tree_bytes_with_repeated_blobs(self):
+    def test_local_import_and_upload_measure_logical_tree_bytes_without_rejecting(self):
         parent = self.api.seed({'old': b'old'})
         self.store.observe_heads()
         candidate, _ = self.store.prepare('main', parent, {'a': b'repeat', 'b': b'repeat'}, 'bounded logical tree')
         self.api.calls.clear()
-        with patch('tools.github_api_store.MAX_TREE_BYTES', 10):
-            with self.assertRaisesRegex(GitHubApiError, 'snapshot exceeds'):
-                self.store.push_prepared('main', candidate)
+        with patch('tools.github_api_store.MAX_TREE_BYTES', 10), self.assertLogs('sync.observations', level='WARNING'):
+            self.assertEqual(self.store.push_prepared('main', candidate), (candidate, True))
             other = GitHubApiStore(self.root / 'bounded-import.git', self.api.repository, api=self.api)
-            with self.assertRaisesRegex(GitHubApiError, '32 MiB tree bound'):
-                other.import_local_snapshot(self.store.path, candidate)
+            imported = other.import_local_snapshot(self.store.path, candidate)
+        self.assertEqual(imported['logical_tree_bytes'], 12)
+        self.assertEqual(self.api.refs['refs/heads/main'], candidate)
+
+    def test_rest_roundtrip_above_old_tree_and_blob_targets_preserves_exact_snapshot(self):
+        body = b'x' * (2 * 1024 * 1024 + 1)
+        files = {f'records/{index}.jsonl': body for index in range(17)}
+        candidate, _ = self.store.prepare('data', None, files, 'large REST snapshot')
+        with self.assertLogs('sync.observations', level='WARNING'):
+            self.store.push_prepared('data', candidate)
+            other = GitHubApiStore(self.root / 'large-read.git', self.api.repository, api=self.api)
+            read_sha, restored = other.read('data')
+        self.assertEqual((read_sha, restored), (candidate, files))
+
+    def test_github_file_limit_rejects_before_any_remote_object_creation(self):
+        candidate, _ = self.store.prepare('data', None, {'large': b'123456'}, 'official limit')
+        with patch('tools.github_api_store.GITHUB_MAX_BLOB_BYTES', 5):
+            with self.assertRaisesRegex(GitHubApiError, 'GitHub 100 MiB'):
+                self.store.push_prepared('data', candidate)
+            with self.assertRaisesRegex(GitHubApiError, 'GitHub 100 MiB'):
+                self.store.import_local_snapshot(self.store.path, candidate)
         self.assertFalse(any(method != 'GET' for method, _, _ in self.api.calls))
 
     def test_candidate_extra_headers_are_rejected_before_api_write(self):
@@ -363,7 +382,7 @@ class Response(io.BytesIO):
 
 
 class RestTransportTests(unittest.TestCase):
-    def test_parallel_responses_share_one_hard_byte_bound_and_deadline(self):
+    def test_parallel_responses_count_all_bytes_after_advisory_totals_are_exceeded(self):
         opener = type('Opener', (), {'open': lambda self, request, timeout: Response(b'{}')})()
         api = GitHubRest('argus-intel-data', 'token', opener=opener, max_wire_bytes=5)
         with ThreadPoolExecutor(max_workers=4) as executor:
@@ -374,13 +393,14 @@ class RestTransportTests(unittest.TestCase):
                     future.result()
                 except GitHubApiError:
                     failures += 1
-        self.assertGreater(failures, 0)
-        self.assertEqual(api.uploaded_bytes + api.downloaded_bytes, 5)
+        self.assertEqual(failures, 0)
+        self.assertEqual(api.uploaded_bytes + api.downloaded_bytes, 8)
+        self.assertTrue(api.report()['capacity_observations'][1]['exceeded'])
         expired = GitHubRest('argus-intel-data', 'token', opener=opener, max_seconds=1)
         expired.started -= 2
-        with self.assertRaisesRegex(GitHubApiError, 'time budget'):
-            expired.request('GET', 'matching-refs/heads/')
-        self.assertEqual(expired.requests, 0)
+        self.assertEqual(expired.request('GET', 'matching-refs/heads/'), {})
+        self.assertEqual(expired.requests, 1)
+        self.assertTrue(expired.report()['capacity_observations'][2]['exceeded'])
 
     def test_credentials_remain_only_in_headers_and_errors_are_redacted(self):
         token = 'fixture-secret-token'
@@ -417,8 +437,27 @@ class RestTransportTests(unittest.TestCase):
         opener = type('Opener', (), {'open': lambda self, request, timeout: Response(b'[]')})()
         api = GitHubRest('argus-intel-data', 'token', opener=opener, max_requests=1)
         self.assertEqual(api.request('GET', 'matching-refs/heads/'), [])
-        with self.assertRaisesRegex(GitHubApiError, 'budget'):
-            api.request('GET', 'matching-refs/heads/')
+        self.assertEqual(api.request('GET', 'matching-refs/heads/'), [])
+        self.assertEqual(api.requests, 2)
+        self.assertTrue(api.report()['capacity_observations'][0]['exceeded'])
+
+    def test_single_response_safety_and_provider_rate_limits_still_fail_closed(self):
+        opener = type('Opener', (), {'open': lambda self, request, timeout: Response(b'{"large":123}')})()
+        api = GitHubRest('argus-intel-data', 'token', opener=opener)
+        with patch('tools.github_api_store.MAX_METADATA_BYTES', 5):
+            with self.assertRaisesRegex(GitHubApiError, 'per-response safety'):
+                api.request('GET', 'matching-refs/heads/')
+        self.assertEqual(api.downloaded_bytes, 6)
+        for status in (403, 429):
+            class RateLimited:
+                def open(self, request, timeout):
+                    raise urllib.error.HTTPError(request.full_url, status, 'rate limited', {}, io.BytesIO(b'secret'))
+            api = GitHubRest('argus-intel-data', 'token', opener=RateLimited())
+            with self.subTest(status=status), self.assertRaises(GitHubApiError) as error:
+                api.request('GET', 'matching-refs/heads/')
+            self.assertEqual(error.exception.status, status)
+            self.assertEqual(api.requests, 1)
+            self.assertNotIn('secret', str(error.exception))
 
 
 if __name__ == '__main__':

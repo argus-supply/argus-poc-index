@@ -113,12 +113,13 @@ class AvailabilityTests(unittest.TestCase):
         checkpoint, _ = refresh({row['record_id']: row}, None, transport(self.policy, [404])[0], NOW, self.policy)
         self.assertEqual(checkpoint, fixture['checkpoint'])
 
-    def test_timeout_retry_shares_four_request_cap_and_preserves_due_state(self):
+    def test_timeout_retry_uses_four_request_background_batch_and_resumes_due_state(self):
         first, _ = refresh(self.records, None, transport(self.policy, [404])[0], NOW, self.policy)
-        exhausted, _ = transport(self.policy, [], max_requests=0)
-        same, metrics = refresh(self.records, first, exhausted, LATER, self.policy)
+        disabled = {**self.policy, 'reference_probe_requests': 0}
+        exhausted, _ = transport(disabled, [], max_requests=0)
+        same, metrics = refresh(self.records, first, exhausted, LATER, disabled)
         self.assertEqual(first, same)
-        self.assertTrue(metrics['deferred_by_budget'])
+        self.assertTrue(metrics['deferred_by_batch'])
         self.assertEqual(metrics['pending_or_due'], 1)
         records = {str(i): poc(i, f'https://github.com/example/poc{i}') for i in range(8)}
         http, _ = transport(self.policy, [TimeoutError('private detail')] * 4)
@@ -128,6 +129,7 @@ class AvailabilityTests(unittest.TestCase):
         self.assertEqual(metrics['pending_or_due'], 6)
         self.assertNotIn('private detail', canonical(state).decode())
         self.assertEqual(metrics['coverage'], 'partial')
+        self.assertTrue(metrics['deferred_by_batch'])
 
     def test_cursor_resumes_and_checkpoint_is_bounded_without_claiming_full_coverage(self):
         records = {str(i): poc(i, f'https://github.com/example/poc{i}') for i in range(20)}
@@ -151,18 +153,20 @@ class AvailabilityTests(unittest.TestCase):
         self.assertEqual(metrics['unsupported_count'], 1)
         self.assertEqual(metrics['coverage'], 'partial')
 
-    def test_numeric_settings_cannot_silently_raise_bounds_and_manifest_cap_applies(self):
+    def test_reference_safety_settings_remain_bounded_and_manifest_target_only_warns(self):
         for key, value in {'reference_probe_requests': 5, 'reference_probe_retries': 2,
             'reference_probe_timeout_seconds': 11, 'reference_probe_bytes': 65537,
             'reference_probe_entries': 257, 'reference_probe_state_bytes': 65537,
             'reference_recheck_hours': 23}.items():
             with self.subTest(key=key), self.assertRaises(ValueError):
                 validate_policy({**self.policy, key: value})
-        with self.assertRaisesRegex(ValueError, 'manifest exceeds'):
-            build_snapshot('argus-supply/argus-poc-index', {}, {}, {}, self.policy, NOW, 'fixture',
-                           extra={'other_bounded_source_state': 'x' * 524288})
+        with self.assertLogs('sync.observations', level='WARNING'):
+            files, _ = build_snapshot('argus-supply/argus-poc-index', {}, {}, {}, self.policy, NOW, 'fixture',
+                                     extra={'other_bounded_source_state': 'x' * 524288})
+        self.assertGreater(len(files['manifest.json']), 524288)
+        self.assertEqual(read_snapshot(files)[3]['other_bounded_source_state'], 'x' * 524288)
 
-    def test_fresh_git_runners_keep_watermarks_and_events_across_failure_recovery_and_quota(self):
+    def test_fresh_git_runners_keep_facts_while_reference_batch_pauses_and_recovers(self):
         def collect(source, *_args, **_kwargs):
             return AdapterResult(records=[poc()] if source == 'poc-in-github' else [],
                 status='ok', revision='a' * 40, completed_watermark='source-progress')
@@ -179,10 +183,11 @@ class AvailabilityTests(unittest.TestCase):
                 (NOW, [404], 500), ('2026-09-09T06:00:00Z', [], 500),
                 (LATER, [], 0), (LATER, [200], 500)]):
                 http, _ = transport(self.policy, statuses, max_requests=limit)
+                policy = {**self.policy, 'reference_probe_requests': 0} if number == 2 else self.policy
                 with patch('sync.run.collect', side_effect=collect), patch('sync.run.consume_intel',
                     return_value=(dependency, {}, {})), patch('sync.run.utcnow', return_value=stamp):
                     result = run('argus-poc-index', str(remote), root / f'runner-{number}',
-                        f'job-{number}', policy=self.policy, http=http)
+                        f'job-{number}', policy=policy, http=http)
                 self.assertEqual(result['status'], 'ok', result)
                 _, files = GitStore(root / f'consumer-{number}', str(remote)).read('data')
                 snapshots.append(read_snapshot(files))
@@ -192,7 +197,7 @@ class AvailabilityTests(unittest.TestCase):
                 if number == 1:
                     self.assertFalse(result['published'])
                 if number == 2:
-                    self.assertTrue(result['reference_availability']['deferred_by_budget'])
+                    self.assertTrue(result['reference_availability']['deferred_by_batch'])
             self.assertEqual([snapshot[0] for snapshot in snapshots], [snapshots[0][0]] * 4)
             self.assertEqual([snapshot[1] for snapshot in snapshots], [snapshots[0][1]] * 4)
             checks = [next(iter(snapshot[3]['reference_availability']['entries'].values()))['availability']

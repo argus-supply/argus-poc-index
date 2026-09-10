@@ -15,7 +15,7 @@ import re
 import urllib.request
 
 from .core import canonical, utcnow
-from .http import BudgetExceeded
+from .observations import threshold_observation
 
 
 class ParentMoved(RuntimeError):
@@ -94,15 +94,21 @@ class GitStore:
             objects.append((path, blob))
         batch = self.run('cat-file', '--batch', data=('\n'.join(blob for _, blob in objects) + '\n').encode()).stdout if objects else b''
         offset = 0
-        for path, _ in objects:
+        for path, expected_blob in objects:
             end = batch.index(b'\n', offset)
-            _, kind, raw_size = batch[offset:end].split()
+            blob, kind, raw_size = batch[offset:end].split()
             size = int(raw_size)
-            if kind != b'blob' or size > 2 * 1024 * 1024 or sum(map(len, files.values())) + size > 32 * 1024 * 1024:
-                raise ValueError('published snapshot exceeds bounds')
+            if blob.decode() != expected_blob or kind != b'blob' or size < 0:
+                raise ValueError('published snapshot object mismatch')
             offset = end + 1
+            if offset + size >= len(batch) or batch[offset + size:offset + size + 1] != b'\n':
+                raise ValueError('truncated published snapshot object')
             files[path] = batch[offset:offset + size]
+            threshold_observation('published_blob_bytes', size, 2 * 1024 * 1024)
             offset += size + 1
+        if offset != len(batch):
+            raise ValueError('unexpected published snapshot objects')
+        threshold_observation('published_tree_bytes', sum(map(len, files.values())), 32 * 1024 * 1024)
         return sha, files
 
     def prepare(self, branch, parent, files, message):

@@ -244,7 +244,7 @@ os._exit(23)
         self.assertNotEqual(state['git_cost']['accounted_upper_bound_bytes'], 9999999)
         self.assertEqual(state['git_cost']['migration']['commit_count'], 3)
 
-    def test_http_migrated_same_day_charge_reduces_new_bootstrap_allocation(self):
+    def test_http_migrated_same_day_charge_remains_without_limiting_collection(self):
         self.policy.update(job_bytes=20, daily_bytes=10)
         legacy = {'day': DAY, 'runner_month': DAY[:7], 'runner_minutes_used': 1,
             'history_upper_bound_bytes': 1000, 'reservations': {'legacy-normal': {
@@ -257,13 +257,13 @@ os._exit(23)
             'commits': [{'phase': 'initialization', 'day': DAY, 'measurement': measured}],
             'baseline_completed_at': None})
         fresh = self.fresh()
-        self.assertEqual(fresh.reserve('new-bootstrap', 20, bootstrap=True), 13)
+        self.assertEqual(fresh.reserve('new-bootstrap', 20, bootstrap=True), 20)
         state = fresh.read()[1]
         self.assertEqual(state['reservations']['legacy-normal']['charged_bytes'], 7)
-        self.assertEqual(state['reservations']['new-bootstrap']['charged_bytes'], 13)
-        self.assertEqual(sum(item['charged_bytes'] for item in state['reservations'].values()), 20)
-        with self.assertRaisesRegex(BudgetExceeded, 'daily byte budget exhausted'):
-            self.fresh('runner-three').reserve('another-bootstrap', 1, bootstrap=True)
+        self.assertEqual(state['reservations']['new-bootstrap']['charged_bytes'], 20)
+        self.assertEqual(sum(item['charged_bytes'] for item in state['reservations'].values()), 27)
+        with self.assertLogs('sync.observations', level='WARNING'):
+            self.assertEqual(self.fresh('runner-three').reserve('another-bootstrap', 1, bootstrap=True), 1)
 
     def test_http_initialization_to_steady_transition_retains_same_day_usage(self):
         self.policy.update(job_bytes=20, daily_bytes=10)
@@ -272,13 +272,13 @@ os._exit(23)
         self.publish(self.ledger, 'complete-baseline', 'data', {'record.json': b'complete'}, complete=True)
         fresh = self.fresh()
         self.assertFalse(fresh.initializing())
-        self.assertEqual(fresh.reserve('steady-http', 10, bootstrap=False), 3)
+        self.assertEqual(fresh.reserve('steady-http', 10, bootstrap=False), 10)
         state = fresh.read()[1]
         self.assertTrue(state['reservations']['initial-http']['initialization'])
         self.assertFalse(state['reservations']['steady-http']['initialization'])
-        self.assertEqual(sum(item['charged_bytes'] for item in state['reservations'].values()), 10)
-        with self.assertRaisesRegex(BudgetExceeded, 'daily byte budget exhausted'):
-            self.fresh('runner-three').reserve('steady-exhausted', 1, bootstrap=False)
+        self.assertEqual(sum(item['charged_bytes'] for item in state['reservations'].values()), 17)
+        with self.assertLogs('sync.observations', level='WARNING'):
+            self.assertEqual(self.fresh('runner-three').reserve('steady-exhausted', 1, bootstrap=False), 1)
 
     def test_unknown_external_data_publication_is_rejected(self):
         original, _ = self.publish(self.ledger, 'baseline', 'data', {'record.json': b'baseline'}, complete=True)
@@ -309,35 +309,59 @@ os._exit(23)
         with self.assertRaisesRegex(ValueError, 'unexpected remote branch'):
             self.fresh().read()
 
-    def test_exact_steady_day_history_and_initialization_inclusive_month_limits(self):
+    def test_exact_steady_day_history_and_initialization_inclusive_month_observations(self):
         self.ledger.reserve('one', 1)
         cost = copy.deepcopy(self.ledger.read()[1]['git_cost'])
         cost.update(accounted_upper_bound_bytes=2 * MIB, initialization_month_bytes={},
                     steady_daily_bytes={DAY: MIB})
-        self.ledger.guard(cost)
+        self.assertFalse(any(row['exceeded'] for row in self.ledger.guard(cost)))
         cost['steady_daily_bytes'][DAY] = MIB + 1
-        with self.assertRaisesRegex(BudgetExceeded, 'steady UTC-day'):
-            self.ledger.guard(cost)
-        cost.update(accounted_upper_bound_bytes=128 * MIB, steady_daily_bytes={})
-        with self.assertRaisesRegex(BudgetExceeded, 'history bound'):
-            self.ledger.guard(cost)
+        self.assertTrue(self.ledger.guard(cost)[1]['exceeded'])
+        cost.update(accounted_upper_bound_bytes=128 * MIB + 1, steady_daily_bytes={})
+        self.assertTrue(self.ledger.guard(cost)[0]['exceeded'])
         cost.update(accounted_upper_bound_bytes=80 * MIB, initialization_month_bytes={DAY[:7]: 75 * MIB},
                     steady_daily_bytes={DAY: MIB})
-        with self.assertRaisesRegex(BudgetExceeded, 'monthly projection'):
-            self.ledger.guard(cost)
+        self.assertTrue(self.ledger.guard(cost)[2]['exceeded'])
         cost['initialization_month_bytes'][DAY[:7]] = 69 * MIB
-        self.ledger.guard(cost)
+        self.assertFalse(any(row['exceeded'] for row in self.ledger.guard(cost)))
 
-    def test_control_reservation_also_obeys_budget_and_failed_write_does_not_advance_remote(self):
+    def test_control_and_data_publish_over_targets_preserving_all_charges(self):
         self.publish(self.ledger, 'baseline', 'data', {'record.json': b'baseline'}, complete=True)
         before_tip, before = self.ledger.read()
         self.policy['daily_git_change_bytes'] = before['git_cost']['steady_daily_bytes'].get(DAY, 0) + 1
-        with self.assertRaisesRegex(BudgetExceeded, 'steady UTC-day'):
-            self.ledger.reserve('denied', 1)
+        self.policy.update(history_bytes=1, monthly_history_growth_bytes=1, git_control_max_bytes=1)
+        with self.assertLogs('sync.observations', level='WARNING'):
+            self.publish(self.ledger, 'over-target', 'data', {'record.json': b'new facts'})
         after_tip, after = self.fresh().read()
-        self.assertEqual(after_tip, before_tip)
-        self.assertEqual(after['git_cost'], before['git_cost'])
-        self.assertNotIn('denied', after['reservations'])
+        self.assertNotEqual(after_tip, before_tip)
+        self.assertGreater(after['git_cost']['accounted_upper_bound_bytes'], before['git_cost']['accounted_upper_bound_bytes'])
+        self.assertEqual(after['reservations']['over-target']['git_publication']['state'], 'committed')
+        self.assertTrue(all(row['exceeded'] for row in after['git_cost']['capacity_observations']))
+
+    def test_runner_and_transfer_actuals_above_reservation_are_not_capped_or_rejected(self):
+        self.policy.update(repository_runner_minutes=1, daily_bytes=1)
+        with self.assertLogs('sync.observations', level='WARNING'):
+            self.ledger.reserve('over-target', 8)
+            self.ledger.settle('over-target', 20, 3, runner_seconds=901)
+        _, state = self.fresh().read()
+        item = state['reservations']['over-target']
+        self.assertEqual(item['charged_bytes'], 20)
+        self.assertEqual(item['reserved_bytes'], 8)
+        self.assertTrue(item['transfer_observation']['exceeded'])
+        self.assertEqual(item['runner_minutes'], 16)
+        self.assertEqual(state['runner_minutes_used'], 16)
+
+    def test_large_local_snapshot_is_measured_and_published_without_old_object_cap(self):
+        body = b'local measured data\n' * 1800000
+        self.assertGreater(len(body), 32 * MIB)
+        with self.assertLogs('sync.observations', level='WARNING'):
+            tip, measured = self.publish(self.ledger, 'large-data', 'data', {'records/large.jsonl': body})
+            current, files = self.fresh().store.read('data')
+        self.assertEqual(current, tip)
+        self.assertEqual(files['records/large.jsonl'], body)
+        self.assertGreater(measured['raw_object_bytes'], len(body))
+        self.assertGreater(measured['actual_pack_bytes'], 0)
+        self.assertEqual(self.ledger.read()[1]['reservations']['large-data']['git_publication']['state'], 'committed')
 
 
 if __name__ == '__main__':

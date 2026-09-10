@@ -125,17 +125,34 @@ class CoreTests(unittest.TestCase):
         self.apply(dict(self.row, affected='invalid'), completed_watermark='new')
         self.assertEqual(self.sources['ghsa']['completed_watermark'], 'old')
 
-    def test_a07_tree_limit_raises_before_publication(self):
+    def test_a07_tree_target_warns_without_losing_records(self):
         self.apply()
         self.policy['max_tree_bytes'] = 1
-        with self.assertRaisesRegex(ValueError, 'tree budget'):
-            self.snapshot()
+        with self.assertLogs('sync.observations', level='WARNING') as logs:
+            files, _ = self.snapshot()
+        self.assertTrue(any('current_tree_bytes' in line for line in logs.output))
+        self.assertEqual(read_snapshot(files)[0], self.records)
 
-    def test_a07_logical_snapshot_limit_raises_before_publication(self):
+    def test_a07_logical_snapshot_target_warns_without_losing_records(self):
         self.apply()
-        with patch('sync.core.MAX_SNAPSHOT_LOGICAL_BYTES', 1), self.assertRaisesRegex(
-                ValueError, 'logical records exceed'):
-            self.snapshot()
+        with patch('sync.core.MAX_SNAPSHOT_LOGICAL_BYTES', 1), self.assertLogs(
+                'sync.observations', level='WARNING') as logs:
+            files, _ = self.snapshot()
+        self.assertTrue(any('snapshot_logical_bytes' in line for line in logs.output))
+        self.assertEqual(read_snapshot(files)[0], self.records)
+
+    def test_a07_source_state_target_preserves_completed_checkpoint(self):
+        self.policy['max_source_state_bytes'] = 1
+        with self.assertLogs('sync.observations', level='WARNING'):
+            self.apply(completed_watermark=NOW, state={'retained': 'full source state'})
+        self.assertEqual(self.sources['ghsa']['completed_watermark'], NOW)
+        self.assertEqual(self.sources['ghsa']['retained'], 'full source state')
+        self.assertEqual(self.sources['ghsa']['status'], 'ok')
+
+    def test_shard_target_below_one_record_keeps_that_record(self):
+        with self.assertLogs('sync.observations', level='WARNING'):
+            shards = shard_rows([self.row], 'records', {**self.policy, 'max_shard_bytes': 1})
+        self.assertEqual(list(shards.values()), [canonical(self.row)])
 
     def test_a07_shards_split_stably_and_have_exact_hashes(self):
         rows = [dict(self.row, record_id=f'ghsa/{i}') for i in range(100)]
@@ -152,11 +169,16 @@ class CoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'checksum'):
             read_snapshot(files)
 
-    def test_policy_cannot_silently_raise_budget(self):
+    def test_project_targets_are_configurable_but_protocol_bounds_remain(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'policy.json'
             path.write_bytes(canonical({**self.policy, 'daily_bytes': 10485761}))
-            with self.assertRaisesRegex(ValueError, 'ceiling'):
+            self.assertEqual(load_policy(path)['daily_bytes'], 10485761)
+            path.write_bytes(canonical({**self.policy, 'daily_bytes': 0}))
+            with self.assertRaisesRegex(ValueError, 'threshold'):
+                load_policy(path)
+            path.write_bytes(canonical({**self.policy, 'max_record_bytes': 16385}))
+            with self.assertRaisesRegex(ValueError, 'protocol ceiling'):
                 load_policy(path)
 
 
@@ -192,12 +214,15 @@ class HttpTests(unittest.TestCase):
             client.get_json('https://api.github.com/x')
         self.assertEqual(client.requests, 3)
 
-    def test_a03_fair_child_cannot_spend_parent_bytes(self):
+    def test_project_transfer_targets_warn_without_truncating_source_data(self):
         client = Http(self.policy, max_bytes=5, opener=Opener([b'123456789']))
         child = client.fork(max_bytes=3, max_requests=2)
-        with self.assertRaises(BudgetExceeded):
-            child.get_bytes('https://api.github.com/x')
-        self.assertEqual((child.bytes, client.bytes), (3, 3))
+        self.assertEqual(child.get_bytes('https://api.github.com/x'), b'123456789')
+        self.assertEqual((child.bytes, client.bytes), (9, 9))
+        observation = {item['metric']: item for item in client.capacity_observations}
+        self.assertEqual(observation['http_job_bytes'], {
+            'metric': 'http_job_bytes', 'observed': 9, 'threshold': 5,
+            'exceeded': True, 'enforcement': 'advisory'})
 
     def test_a14_arbitrary_origins_and_redirects_are_rejected(self):
         client = Http(self.policy)
@@ -248,17 +273,30 @@ class GitTests(unittest.TestCase):
         first = Ledger(self.one, policy, '2026-09-09')
         self.assertEqual(first.reserve('killed', 8), 8)
         fresh = Ledger(self.two, policy, '2026-09-09')
-        self.assertEqual(fresh.reserve('next', 8), 2)
-        with self.assertRaises(BudgetExceeded):
-            fresh.reserve('third', 8)
+        with self.assertLogs('sync.observations', level='WARNING'):
+            self.assertEqual(fresh.reserve('next', 8), 8)
+            self.assertEqual(fresh.reserve('third', 8), 8)
         fresh.settle('next', 1, 1)
-        self.assertEqual(first.reserve('fourth', 8), 1)
+        self.assertEqual(first.reserve('fourth', 8), 8)
+        state = first.read()[1]
+        self.assertEqual(state['reservations']['killed']['charged_bytes'], 8)
+        self.assertEqual(state['reservations']['next']['charged_bytes'], 1)
         self.assertEqual(Ledger(self.two, policy, '2026-09-10').reserve('newday', 8), 8)
 
-    def test_a16_history_ceiling_pauses_publication(self):
+    def test_a16_history_target_warns_and_allows_publication(self):
         ledger = Ledger(self.one, self.policy)
         ledger.reserve('test', 100)
-        self.assertFalse(ledger.publication_allowed(self.policy['history_bytes']))
+        with self.assertLogs('sync.observations', level='WARNING'):
+            self.assertTrue(ledger.publication_allowed(self.policy['history_bytes']))
+
+    def test_git_snapshot_above_old_tree_and_blob_targets_roundtrips(self):
+        body = b'lossless capacity fixture\n' * (1400000)
+        self.assertGreater(len(body), 32 * 1024 * 1024)
+        sha, _ = self.one.publish('data', None, {'records/large.jsonl': body}, 'large snapshot')
+        with self.assertLogs('sync.observations', level='WARNING') as logs:
+            observed, files = self.two.read('data')
+        self.assertEqual((observed, files), (sha, {'records/large.jsonl': body}))
+        self.assertTrue(any('published_tree_bytes' in line for line in logs.output))
 
 
 if __name__ == '__main__':

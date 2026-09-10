@@ -151,6 +151,21 @@ class BaselineCorrectionTests(unittest.TestCase):
                 self.assertEqual(fresh['reservations']['old-success']['git_publication']['baseline_complete'], True)
                 self.assertEqual(fresh['git_cost']['baseline_corrections'][0]['invalidated_completed_at'], OLD_MARKER)
 
+    def test_fifth_proven_correction_retains_existing_evidence_and_all_costs(self):
+        parent, state = self.mistaken_baseline()
+        existing = [{'at': OLD_MARKER, 'reason': f'historical correction {index}'} for index in range(4)]
+        state['git_cost']['baseline_corrections'] = copy.deepcopy(existing)
+        self.ledger.write(parent, state, 'fixture existing correction history', initialization=True)
+        before = self.ledger.read()[1]['git_cost']['accounted_upper_bound_bytes']
+        with self.assertLogs('sync.observations', level='WARNING'):
+            self.ledger.correct_incomplete_dependency_baseline(self.data_sha, [self.proof])
+        after = self.fresh().read()[1]['git_cost']
+        self.assertEqual(after['baseline_corrections'][:4], existing)
+        self.assertEqual(len(after['baseline_corrections']), 5)
+        self.assertEqual(after['baseline_corrections'][4]['data_commit'], self.data_sha)
+        self.assertEqual(after['baseline_corrections'][4]['cost_refund_bytes'], 0)
+        self.assertGreater(after['accounted_upper_bound_bytes'], before)
+
     def test_complete_pinned_dependency_cannot_invalidate_a_baseline(self):
         _, before = self.mistaken_baseline(complete_dependency=True)
         old_heads = self.store.observe_heads()

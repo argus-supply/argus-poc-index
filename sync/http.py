@@ -10,6 +10,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from .observations import threshold_observation
+
 
 class BudgetExceeded(RuntimeError):
     """The current durable reservation cannot fund another complete unit."""
@@ -70,7 +72,12 @@ class Redirects(urllib.request.HTTPRedirectHandler):
 
 
 class Http:
-    """A source-local allocation shares its parent's actual-byte/job counters."""
+    """Allowlisted transport with advisory aggregate cost measurements.
+
+    Project byte and request targets never stop synchronization. The time
+    boundary still yields a durable continuation before the Actions job is
+    killed, and each response remains bounded as a transport-safety rule.
+    """
     def __init__(self, policy, *, token=None, max_bytes=None, max_requests=None,
                  parent=None, opener=None, sleep=time.sleep, clock=time.monotonic):
         self.policy = policy
@@ -84,6 +91,8 @@ class Http:
         self.started = parent.started if parent else clock()
         self.opener = opener or urllib.request.build_opener(Redirects())
         self.last_headers = {}
+        self.capacity_observations = [] if parent is None else parent.capacity_observations
+        self._reported_thresholds = set() if parent is None else parent._reported_thresholds
 
     def fork(self, *, max_bytes, max_requests):
         return Http(self.policy, token=self.token, parent=self, max_bytes=max_bytes,
@@ -92,32 +101,47 @@ class Http:
     def _before(self):
         if self.clock() - self.started >= self.policy['job_seconds']:
             raise BudgetExceeded('job time budget exhausted')
-        if self.bytes >= self.max_bytes or self.requests >= self.max_requests:
-            raise BudgetExceeded('request or byte budget exhausted')
         if self.parent:
             self.parent._before()
         self.requests += 1
+        self._observe_capacity()
 
     def _charge(self, size):
         self.bytes += size
         if self.parent:
             self.parent._charge(size)
 
-    def _remaining(self):
-        local = self.max_bytes - self.bytes
-        return min(local, self.parent._remaining()) if self.parent else local
+    def _observe_capacity(self):
+        root = self
+        while root.parent:
+            root = root.parent
+        for name, observed, threshold in (
+                ('http_job_bytes', root.bytes, root.max_bytes),
+                ('http_job_requests', root.requests, root.max_requests)):
+            if observed > threshold and name not in root._reported_thresholds:
+                observation = threshold_observation(name, observed, threshold)
+                root._reported_thresholds.add(name)
+            else:
+                observation = {'metric': name, 'observed': observed, 'threshold': threshold,
+                               'exceeded': observed > threshold, 'enforcement': 'advisory'}
+            current = {item['metric']: item for item in root.capacity_observations}
+            current[name] = observation
+            root.capacity_observations[:] = current.values()
 
     def _read(self, response):
         chunks = []
+        received = 0
+        limit = self.policy.get('max_response_bytes', self.policy['job_bytes'])
         while True:
-            remaining = self._remaining()
-            if remaining <= 0:
-                raise BudgetExceeded('response byte budget exhausted')
-            data = response.read(min(65536, remaining))
+            data = response.read(min(65536, limit + 1 - received))
             self._charge(len(data))
             if not data:
+                self._observe_capacity()
                 return b''.join(chunks)
             chunks.append(data)
+            received += len(data)
+            if received > limit:
+                raise FetchError('individual upstream response exceeds safety bound')
             if self.clock() - self.started >= self.policy['job_seconds']:
                 raise BudgetExceeded('job time budget exhausted')
 
@@ -136,12 +160,14 @@ class Http:
                     self.last_headers = dict(response.headers)
                     body = self._read(response)
                     if response.headers.get('Content-Encoding', '').lower() == 'gzip':
+                        decode_limit = self.policy.get(
+                            'max_decompressed_response_bytes', self.policy['job_bytes'])
                         decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
                         try:
-                            body = decoder.decompress(body, self.policy['job_bytes'] + 1)
+                            body = decoder.decompress(body, decode_limit + 1)
                         except zlib.error:
                             raise FetchError('invalid compressed upstream response') from None
-                        if len(body) > self.policy['job_bytes'] or not decoder.eof or decoder.unused_data:
+                        if len(body) > decode_limit or not decoder.eof or decoder.unused_data:
                             raise FetchError('decompressed response exceeds bound or is incomplete')
                     self.decompressed_bytes += len(body)
                     if self.parent:

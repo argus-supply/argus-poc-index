@@ -19,6 +19,7 @@ import urllib.request
 
 from sync.gitstore import GitStore, ParentMoved
 from sync.gitcost import GitCostUnavailable, _Git
+from sync.observations import threshold_observation
 
 
 REPOSITORIES = ('argus-intel-data', 'argus-poc-index', 'argus-detection-resources')
@@ -28,6 +29,8 @@ MAX_TREE_BYTES = 32 * 1024 * 1024
 MAX_BLOB_BYTES = 2 * 1024 * 1024
 MAX_METADATA_BYTES = 16 * 1024 * 1024
 MAX_ENTRIES = 100000
+GITHUB_MAX_BLOB_BYTES = 100 * 1024 * 1024
+MAX_BLOB_JSON_BYTES = ((GITHUB_MAX_BLOB_BYTES + 2) // 3 * 4) + 65536
 
 
 class GitHubApiError(RuntimeError):
@@ -45,14 +48,14 @@ class NoRedirects(urllib.request.HTTPRedirectHandler):
 
 
 class GitHubRest:
-    """A bounded, non-retrying REST client; token is held only in process memory."""
+    """Non-retrying REST with advisory totals and hard per-response safety bounds."""
     def __init__(self, repository, token, *, opener=None, max_requests=5000,
                  max_wire_bytes=128 * 1024 * 1024, max_seconds=1800):
         if repository not in REPOSITORIES or not isinstance(token, str) or not token or '\n' in token or '\r' in token:
             raise ValueError('expected one authorized repository and an in-memory token')
-        for value, ceiling in ((max_requests, 5000), (max_wire_bytes, 128 * 1024 * 1024), (max_seconds, 1800)):
-            if type(value) is not int or not 0 < value <= ceiling:
-                raise ValueError('invalid recovery transport bound')
+        for value in (max_requests, max_wire_bytes, max_seconds):
+            if type(value) is not int or value <= 0:
+                raise ValueError('invalid recovery transport target')
         self.repository, self.token = repository, token
         self.opener = opener or urllib.request.build_opener(NoRedirects())
         self.max_requests, self.max_wire_bytes, self.max_seconds = max_requests, max_wire_bytes, max_seconds
@@ -64,7 +67,15 @@ class GitHubRest:
             'request_json_bytes_attempted': self.uploaded_bytes, 'response_json_bytes_read': self.downloaded_bytes,
             'elapsed_seconds': round(time.monotonic() - self.started, 3),
             'limits': {'requests': self.max_requests, 'wire_bytes': self.max_wire_bytes, 'seconds': self.max_seconds},
+            'enforcement': 'advisory', 'capacity_observations': self.observations(),
             'scope': 'Request payload bytes reserved before send and response bytes actually read; separate from compressed Git object costs'}
+
+    def observations(self):
+        """Report cumulative usage without preventing a subsequent request."""
+        return [threshold_observation(name, value, target) for name, value, target in (
+            ('rest_requests', self.requests, self.max_requests),
+            ('rest_wire_bytes', self.uploaded_bytes + self.downloaded_bytes, self.max_wire_bytes),
+            ('rest_seconds', round(time.monotonic() - self.started, 3), self.max_seconds))]
 
     def request(self, method, route, payload=None):
         allowed = {
@@ -79,23 +90,24 @@ class GitHubRest:
         if method == 'PATCH' and (payload or {}).get('force') is not False:
             raise ValueError('recovery ref updates must be non-force')
         body = None if payload is None else json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode()
-        if body is not None and len(body) > MAX_METADATA_BYTES:
-            raise GitHubApiError('GitHub REST request exceeds per-request bound')
+        request_limit = MAX_BLOB_JSON_BYTES if method == 'POST' and route == 'blobs' else MAX_METADATA_BYTES
+        response_limit = MAX_BLOB_JSON_BYTES if method == 'GET' and route.startswith('blobs/') else MAX_METADATA_BYTES
+        if body is not None:
+            if method == 'POST' and route == 'blobs' and len(body) > request_limit:
+                raise GitHubApiError('GitHub REST blob request exceeds GitHub file limit envelope')
+            threshold_observation('rest_request_json_bytes', len(body), MAX_METADATA_BYTES)
         with self.lock:
-            if self.requests >= self.max_requests or time.monotonic() - self.started >= self.max_seconds:
-                raise GitHubApiError('GitHub REST recovery request or time budget exhausted')
             size = len(body or b'')
-            if self.uploaded_bytes + self.downloaded_bytes + size > self.max_wire_bytes:
-                raise GitHubApiError('GitHub REST recovery byte budget exhausted')
             self.requests += 1
             self.uploaded_bytes += size
+            self.observations()
         url = 'https://api.github.com/repos/argus-supply/' + self.repository + '/git/' + route
         request = urllib.request.Request(url, data=body, method=method, headers={
             'Authorization': 'Bearer ' + self.token, 'Accept': 'application/vnd.github+json',
             'Accept-Encoding': 'identity', 'Content-Type': 'application/json',
             'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'ARGUS-local-git-recovery/1.0'})
         try:
-            with self.opener.open(request, timeout=min(30, max(1, self.max_seconds - (time.monotonic() - self.started)))) as response:
+            with self.opener.open(request, timeout=30) as response:
                 if not 200 <= response.status < 300:
                     raise GitHubApiError('GitHub REST HTTP ' + str(response.status), response.status)
                 if 'rel="next"' in response.headers.get('Link', ''):
@@ -104,20 +116,18 @@ class GitHubRest:
                     raise GitHubApiError('GitHub REST compressed response refused')
                 chunks, received = [], 0
                 while True:
-                    # Serializing bounded reads prevents four concurrent responses
-                    # from each consuming the same remaining byte allowance.
+                    # Count every received byte across concurrent requests. The
+                    # per-response cap protects against untrusted oversized JSON.
                     with self.lock:
-                        remaining = self.max_wire_bytes - self.uploaded_bytes - self.downloaded_bytes
-                        if remaining <= 0 or time.monotonic() - self.started >= self.max_seconds:
-                            raise GitHubApiError('GitHub REST response exceeds recovery bound')
-                        chunk = response.read(min(65536, remaining, MAX_METADATA_BYTES - received + 1))
+                        chunk = response.read(min(65536, response_limit - received + 1))
                         self.downloaded_bytes += len(chunk)
                     received += len(chunk)
-                    if received > MAX_METADATA_BYTES or time.monotonic() - self.started > self.max_seconds:
-                        raise GitHubApiError('GitHub REST response exceeds recovery bound')
+                    if received > response_limit:
+                        raise GitHubApiError('GitHub REST response exceeds per-response safety bound')
                     if not chunk:
                         break
                     chunks.append(chunk)
+                self.observations()
                 return json.loads(b''.join(chunks))
         except urllib.error.HTTPError as error:
             status = error.code
@@ -228,7 +238,7 @@ class GitHubApiStore(GitStore):
 
         source_git, destination_git = _Git(source, 90), _Git(self.path, 90)
 
-        def bounded(git, *args, data=None, limit=MAX_METADATA_BYTES):
+        def bounded(git, *args, data=None, limit=None):
             try:
                 return git.run(*args, data=data, limit=limit)
             except GitCostUnavailable:
@@ -248,11 +258,11 @@ class GitHubApiStore(GitStore):
                 raise GitHubApiError('unsupported local snapshot tree mode')
             objects[checked_sha(oid)] = kind
             entry_count += 1
-            if entry_count > MAX_ENTRIES or len(objects) > MAX_ENTRIES:
-                raise GitHubApiError('local snapshot object inventory exceeds bound')
             if kind == 'blob':
                 blob_paths.append(oid)
         ordered = sorted(objects)
+        threshold_observation('local_snapshot_entries', entry_count, MAX_ENTRIES)
+        threshold_observation('local_snapshot_objects', len(objects), MAX_ENTRIES)
         request = ('\n'.join(ordered) + '\n').encode()
         batch_format = '--batch-check=%(objectname) %(objecttype) %(objectsize)'
         checks = bounded(source_git, 'cat-file', batch_format, data=request).splitlines()
@@ -264,14 +274,15 @@ class GitHubApiStore(GitStore):
             if len(fields) != 3 or fields[:2] != [expected, objects[expected]] or not fields[2].isdigit():
                 raise GitHubApiError('local snapshot object identity or type mismatch')
             oid, kind, size = fields[0], fields[1], int(fields[2])
-            if size > (MAX_BLOB_BYTES if kind == 'blob' else MAX_METADATA_BYTES):
-                raise GitHubApiError('local snapshot object exceeds bound')
+            if kind == 'blob' and size > GITHUB_MAX_BLOB_BYTES:
+                raise GitHubApiError('local snapshot exceeds GitHub 100 MiB file limit')
+            threshold_observation('local_snapshot_object_bytes', size,
+                                  MAX_BLOB_BYTES if kind == 'blob' else MAX_METADATA_BYTES)
             sizes[oid] = size
         total = sum(sizes[oid] for oid in blob_paths)
-        if total > MAX_TREE_BYTES:
-            raise GitHubApiError('local snapshot exceeds blob or 32 MiB tree bound')
-        if sum(sizes.values()) > MAX_TREE_BYTES + MAX_METADATA_BYTES:
-            raise GitHubApiError('local snapshot aggregate object bytes exceed bound')
+        threshold_observation('local_snapshot_tree_bytes', total, MAX_TREE_BYTES)
+        threshold_observation('local_snapshot_raw_object_bytes', sum(sizes.values()),
+                              MAX_TREE_BYTES + MAX_METADATA_BYTES)
         present = bounded(destination_git, 'cat-file', batch_format, data=request).splitlines()
         if len(present) != len(ordered):
             raise GitHubApiError('destination object inventory is incomplete')
@@ -285,7 +296,7 @@ class GitHubApiStore(GitStore):
         if missing:
             pack = bounded(source_git, 'pack-objects', '--stdout', '--compression=6',
                 '--window=0', '--depth=0', '--threads=1', '--no-reuse-object', '--no-reuse-delta',
-                data=('\n'.join(missing) + '\n').encode(), limit=64 * 1024 * 1024)
+                data=('\n'.join(missing) + '\n').encode(), limit=None)
             pack_bytes = len(pack)
             if len(pack) < 32 or pack[:4] != b'PACK' or int.from_bytes(pack[8:12], 'big') != len(missing):
                 raise GitHubApiError('snapshot pack contains an unexpected object inventory')
@@ -321,8 +332,9 @@ class GitHubApiStore(GitStore):
         if response.get('truncated') is not False or response.get('sha') != root:
             raise GitHubApiError('GitHub REST tree is truncated or has the wrong SHA')
         entries = response.get('tree')
-        if not isinstance(entries, list) or len(entries) > MAX_ENTRIES:
-            raise GitHubApiError('GitHub REST tree inventory exceeds bound')
+        if not isinstance(entries, list):
+            raise GitHubApiError('invalid GitHub REST tree inventory')
+        threshold_observation('rest_snapshot_entries', len(entries), MAX_ENTRIES)
         trees, blobs, children, total, paths = {'': root}, {}, {}, 0, set()
         for item in entries:
             path, kind, mode, oid = item.get('path'), item.get('type'), item.get('mode'), checked_sha(item.get('sha'))
@@ -335,16 +347,18 @@ class GitHubApiStore(GitStore):
                 trees[path] = oid
             elif kind == 'blob' and mode in ('100644', '100755'):
                 size = item.get('size')
-                if type(size) is not int or not 0 <= size <= MAX_BLOB_BYTES:
-                    raise GitHubApiError('GitHub REST blob exceeds bound')
+                if type(size) is not int or not 0 <= size <= GITHUB_MAX_BLOB_BYTES:
+                    raise GitHubApiError('GitHub REST blob exceeds GitHub 100 MiB file limit')
+                threshold_observation('rest_blob_bytes', size, MAX_BLOB_BYTES)
                 total += size
                 if oid in blobs and blobs[oid] != size:
                     raise GitHubApiError('GitHub REST blob size disagrees across paths')
                 blobs[oid] = size
             else:
                 raise GitHubApiError('GitHub REST tree mode is unsupported')
-        if total > MAX_TREE_BYTES or any(parent not in trees for parent in children):
-            raise GitHubApiError('GitHub REST tree exceeds 32 MiB or omits a parent tree')
+        if any(parent not in trees for parent in children):
+            raise GitHubApiError('GitHub REST tree omits a parent tree')
+        threshold_observation('rest_snapshot_tree_bytes', total, MAX_TREE_BYTES)
 
         def download(oid):
             if self._has(oid, 'blob'):
@@ -406,8 +420,7 @@ class GitHubApiStore(GitStore):
             raise ParentMoved('GitHub REST branch moved before publication')
         known = set().union(*(self.snapshots[value]['objects'] for value in tips.values())) if tips else set()
         raw_entries = self.run('ls-tree', '-rzt', '--full-tree', sha).stdout
-        if len(raw_entries) > MAX_METADATA_BYTES:
-            raise GitHubApiError('candidate tree metadata exceeds bound')
+        threshold_observation('candidate_tree_metadata_bytes', len(raw_entries), MAX_METADATA_BYTES)
         trees, blobs, children, total = {'': payload['tree']}, {}, {}, 0
         for raw in raw_entries.split(b'\0'):
             if not raw:
@@ -421,14 +434,15 @@ class GitHubApiStore(GitStore):
                 trees[path] = oid
             elif mode in ('100644', '100755') and kind == 'blob':
                 size = int(self.run('cat-file', '-s', oid).stdout)
-                if size > MAX_BLOB_BYTES:
-                    raise GitHubApiError('candidate blob exceeds bound')
+                if size > GITHUB_MAX_BLOB_BYTES:
+                    raise GitHubApiError('candidate exceeds GitHub 100 MiB file limit')
+                threshold_observation('candidate_blob_bytes', size, MAX_BLOB_BYTES)
                 blobs[oid] = size
                 total += size
             else:
                 raise GitHubApiError('candidate tree mode is unsupported')
-        if total > MAX_TREE_BYTES or len(trees) + len(blobs) > MAX_ENTRIES:
-            raise GitHubApiError('candidate snapshot exceeds recovery bound')
+        threshold_observation('candidate_tree_bytes', total, MAX_TREE_BYTES)
+        threshold_observation('candidate_snapshot_entries', len(trees) + len(blobs), MAX_ENTRIES)
 
         def upload(oid):
             body = self.run('cat-file', 'blob', oid).stdout

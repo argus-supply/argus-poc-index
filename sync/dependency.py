@@ -3,7 +3,8 @@ import json
 import re
 
 from .core import canonical, digest, validate
-from .continuations import assemble_records
+from .continuations import iter_records
+from .observations import threshold_observation
 
 
 INTEL_SOURCES = ('cve', 'ghsa', 'kev')
@@ -30,8 +31,9 @@ def coverage_summary(manifest):
 
 def read_manifest(client, repository, sha, expected_hash=None):
     body = client.get_bytes(f'https://raw.githubusercontent.com/{repository}/{sha}/manifest.json')
-    if len(body) > 524288 or (expected_hash is not None and digest(body) != expected_hash):
-        raise ValueError('intel dependency manifest size or fixed-revision hash mismatch')
+    threshold_observation('intel_dependency_manifest_bytes', len(body), 524288)
+    if expected_hash is not None and digest(body) != expected_hash:
+        raise ValueError('intel dependency manifest fixed-revision hash mismatch')
     manifest = json.loads(body)
     validate('manifest', manifest)
     if manifest['repository'] != repository:
@@ -105,7 +107,7 @@ def consume_intel(client, requested_sha, previous, previous_files):
         if len(body) != descriptor['bytes'] or digest(body) != descriptor['sha256']:
             raise ValueError('dependency projection checksum mismatch')
         records.extend(json.loads(line) for line in body.splitlines())
-    logical = assemble_records(records)
+    logical = iter_records(records, max_snapshot_logical_bytes=None)
     active = [{key: row.get(key) for key in ('record_id', 'source_id', 'native_id', 'kind', 'aliases',
                 'status', 'title', 'references', 'published_at', 'source_modified_at')}
               for row in logical if row['status'] == 'active']

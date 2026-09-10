@@ -54,7 +54,7 @@ class _Git:
                     try:
                         while chunk := process.stdout.read(65536):
                             size += len(chunk)
-                            if size > limit:
+                            if limit is not None and size > limit:
                                 process.kill()
                                 raise GitCostUnavailable('Git measurement output exceeds limit')
                             digest.update(chunk)
@@ -95,7 +95,7 @@ def _snapshot(git, oid, oid_pattern, max_objects, metadata_limit):
         if kind not in ('tree', 'blob') or not oid_pattern.fullmatch(raw_oid):
             raise GitCostUnavailable('Unsupported tree object or submodule in baseline')
         objects[raw_oid] = kind
-        if len(objects) > max_objects:
+        if max_objects is not None and len(objects) > max_objects:
             raise GitCostUnavailable('Git measurement object count exceeds limit')
     return objects, parents
 
@@ -111,13 +111,17 @@ def measure_increment(path, candidate, observed_tips, *, baseline_complete,
     Candidate parents must be observed tips, so an unmeasured intermediate commit
     cannot disappear from the cost. A candidate that is already a tip is a no-op.
     Bounds cover the union of baseline and candidate objects, not just new bytes.
+    Explicit audit bounds fail closed. Local publication accounting may pass
+    ``None`` for capacity bounds, retaining streamed pack hashing and the command
+    timeout without turning project cost targets into publication gates.
     """
     if baseline_complete is not True or not isinstance(observed_tips, dict):
         raise GitCostUnavailable('Complete observed all-branch baseline is required')
     if len(observed_tips) > 1024:
         raise GitCostUnavailable('Observed branch inventory exceeds limit')
-    limits = (max_objects, max_raw_bytes, max_object_bytes, max_pack_bytes, metadata_limit, timeout_seconds)
-    if any(type(value) is not int or value <= 0 for value in limits):
+    limits = (max_objects, max_raw_bytes, max_object_bytes, max_pack_bytes, metadata_limit)
+    if (any(value is not None and (type(value) is not int or value <= 0) for value in limits)
+            or type(timeout_seconds) is not int or timeout_seconds <= 0):
         raise ValueError('Git measurement limits must be positive integers')
     git = _Git(path, timeout_seconds)
     if git.run('rev-parse', '--is-bare-repository').strip() != b'true':
@@ -138,13 +142,13 @@ def measure_increment(path, candidate, observed_tips, *, baseline_complete,
     for oid in sorted(tips):
         objects, _ = _snapshot(git, oid, oid_pattern, max_objects, metadata_limit)
         baseline.update(objects)
-        if len(baseline) > max_objects:
+        if max_objects is not None and len(baseline) > max_objects:
             raise GitCostUnavailable('Git baseline object count exceeds limit')
     proposed, parents = _snapshot(git, candidate, oid_pattern, max_objects, metadata_limit)
     if candidate not in tips and not set(parents) <= tips:
         raise GitCostUnavailable('Candidate parent is absent from observed branch tips')
     union = {**baseline, **proposed}
-    if len(union) > max_objects:
+    if max_objects is not None and len(union) > max_objects:
         raise GitCostUnavailable('Git measurement object count exceeds limit')
     ordered = sorted(union)
     checks = git.run('cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)',
@@ -158,10 +162,11 @@ def measure_increment(path, candidate, observed_tips, *, baseline_complete,
             size = int(raw_size)
         except (UnicodeError, ValueError) as error:
             raise GitCostUnavailable('Missing or invalid local baseline object') from error
-        if oid != expected or kind != union[expected] or not 0 <= size <= max_object_bytes:
+        if (oid != expected or kind != union[expected] or size < 0
+                or (max_object_bytes is not None and size > max_object_bytes)):
             raise GitCostUnavailable('Invalid or oversized local baseline object')
         total += size
-        if total > max_raw_bytes:
+        if max_raw_bytes is not None and total > max_raw_bytes:
             raise GitCostUnavailable('Git measurement raw object bytes exceed limit')
         sizes[oid] = size
     added = sorted(set(proposed) - baseline.keys())

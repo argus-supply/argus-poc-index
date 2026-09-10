@@ -21,6 +21,7 @@ import yaml
 
 from .http import BudgetExceeded, FetchError
 from .continuations import split_record
+from .observations import threshold_observation
 
 
 CVE = re.compile(r'CVE-\d{4}-\d{4,}')
@@ -472,7 +473,9 @@ class Run:
             completed_watermark=self.old.get('completed_watermark'))
         self.cursor = copy.deepcopy(self.old.get('continuation') or {})
         self.units = 0
-        self.limit = policy.get('adapter_max_units', 400)
+        # Explicit fixture limits exercise continuation. Production collection
+        # advances until its Actions time boundary or an external rate limit.
+        self.limit = policy.get('adapter_max_units')
 
     def add(self, row):
         self.check_record(row)
@@ -491,7 +494,7 @@ class Run:
 
     def unit(self):
         self.units += 1
-        if self.units > self.limit:
+        if self.limit is not None and self.units > self.limit:
             raise ValueError('adapter_unit_budget_exhausted')
 
     def finish(self, revision, *, authoritative=None, watermark=None):
@@ -1120,8 +1123,8 @@ class Run:
             path = checked_path(entry['path'])
             if path.split('/')[0] in ('http', 'network', 'helpers'):
                 inventory[path] = {'sha': entry['sha'], 'size': entry.get('size'), 'mode': entry.get('mode')}
-        if len(canonical(inventory)) > self.policy.get('max_tree_bytes', 32 * 1024 * 1024):
-            raise ValueError('oversize Nuclei inventory')
+        threshold_observation('nuclei_inventory_bytes', len(canonical(inventory)),
+                              self.policy.get('max_tree_bytes', 32 * 1024 * 1024))
         self.cursor.setdefault('offset', 0)
         paths = sorted(p for p in inventory if p.split('/')[0] in ('http', 'network') and p.endswith(('.yaml', '.yml')))
         auxiliary = self.state.get('auxiliary_files', {})

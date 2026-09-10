@@ -16,6 +16,7 @@ import math
 from .core import canonical, utcnow
 from .gitcost import PACK_PARAMETERS, measure_increment
 from .http import BudgetExceeded
+from .observations import threshold_observation
 
 
 class CostMigrationRequired(RuntimeError):
@@ -98,12 +99,17 @@ class Ledger:
         files = {'ledger.json': canonical(ledger)}
         current = canonical(health) if health is not None else self.health
         if current:
-            if len(current) > 65536:
-                raise ValueError('health summary exceeds 64 KiB')
+            threshold_observation('control_health_bytes', len(current), 65536)
             files['health.json'] = current
-        if sum(map(len, files.values())) > self.policy['git_control_max_bytes']:
-            raise ValueError('control snapshot exceeds configured bound; reservations retained')
+        threshold_observation('control_tree_bytes', sum(map(len, files.values())),
+                              self.policy['git_control_max_bytes'])
         return files
+
+    def measure(self, candidate, tips):
+        """Account all local candidate objects without enforcing capacity targets."""
+        return measure_increment(self.store.path, candidate, tips, baseline_complete=True,
+            max_objects=None, max_raw_bytes=None, max_object_bytes=None,
+            max_pack_bytes=None, metadata_limit=None)
 
     def charge(self, cost, amount, initialization, day=None):
         day = day or self.day
@@ -116,20 +122,20 @@ class Ledger:
             cost['steady_daily_bytes'][day] = cost['steady_daily_bytes'].get(day, 0) + amount
 
     def guard(self, cost):
-        if cost['accounted_upper_bound_bytes'] >= self.policy['history_bytes']:
-            raise BudgetExceeded('compressed Git history bound reached; publication paused')
+        """Persist advisory Git cost observations without rejecting publication."""
         daily = cost['steady_daily_bytes']
-        # A UTC-day ceiling is stricter than the ADR daily-average ceiling.
-        if daily.get(self.day, 0) > self.policy['daily_git_change_bytes']:
-            raise BudgetExceeded('steady UTC-day compressed Git budget exhausted')
         month = self.day[:7]
         initialization = cost['initialization_month_bytes'].get(month, 0)
         days = calendar.monthrange(int(self.day[:4]), int(self.day[5:7]))[1]
         steady = sum(value for day, value in daily.items() if day.startswith(month))
         observed_days = max(1, len([day for day in daily if day.startswith(month)]))
         projection = initialization + steady / observed_days * days
-        if projection >= self.policy['monthly_history_growth_bytes']:
-            raise BudgetExceeded('compressed Git monthly projection reached; initialization reported once')
+        cost['capacity_observations'] = [threshold_observation(name, observed, threshold)
+            for name, observed, threshold in (
+                ('git_history_bytes', cost['accounted_upper_bound_bytes'], self.policy['history_bytes']),
+                ('git_steady_daily_bytes', daily.get(self.day, 0), self.policy['daily_git_change_bytes']),
+                ('git_monthly_projection_bytes', projection, self.policy['monthly_history_growth_bytes']))]
+        return cost['capacity_observations']
 
     def write(self, parent, ledger, message, *, initialization, health=None):
         from .gitstore import ParentMoved
@@ -145,13 +151,13 @@ class Ledger:
             candidate_ledger['last_control_charge'] = {'upper_bound_bytes': allowance,
                 'phase': 'initialization' if initialization else 'steady', 'day': self.day,
                 'parent': parent, 'metric': 'git-object-cost-v1'}
+            self.guard(candidate_ledger['git_cost'])
             candidate, changed = self.store.prepare('control', parent, self.files(candidate_ledger, health), message)
-            measured = measure_increment(self.store.path, candidate, tips, baseline_complete=True)
+            measured = self.measure(candidate, tips)
             actual = measured['compressed_object_upper_bound_bytes']
             if actual > allowance:
                 allowance = actual + self.policy['git_control_reservation_margin_bytes']
                 continue
-            self.guard(candidate_ledger['git_cost'])
             self.store.push_prepared('control', candidate)
             self.control_measurements.append({'candidate': candidate, 'measured_pack_bytes': actual,
                 'charged_upper_bound_bytes': allowance, 'measurement': measured})
@@ -167,13 +173,15 @@ class Ledger:
             limit = self.policy['job_bytes'] if bootstrap else self.policy['daily_bytes']
             used = sum(item['charged_bytes'] for item in ledger['reservations'].values()
                        if item['day'] == self.day)
-            allocation = min(requested, max(0, limit - used))
-            if allocation <= 0 and not publication_only:
-                raise BudgetExceeded('persistent daily byte budget exhausted')
+            if type(requested) is not int or requested < 0:
+                raise ValueError('invalid transfer reservation')
+            allocation = requested
             minutes = 0 if publication_only else 12
             runner_limit = self.policy.get('repository_runner_minutes', self.policy['monthly_runner_minutes'])
-            if ledger['runner_minutes_used'] + minutes > runner_limit:
-                raise BudgetExceeded('persistent monthly runner budget exhausted')
+            ledger['capacity_observations'] = [
+                threshold_observation('http_daily_reserved_bytes', used + allocation, limit),
+                threshold_observation('runner_monthly_reserved_minutes',
+                    ledger['runner_minutes_used'] + minutes, runner_limit)]
             ledger['runner_minutes_used'] += minutes
             ledger['reservations'][job_id] = {'charged_bytes': allocation, 'reserved_bytes': allocation,
                 'status': 'reserved', 'started_at': utcnow(), 'day': self.day,
@@ -195,7 +203,7 @@ class Ledger:
             if item.get('git_publication'):
                 raise BudgetExceeded('publication already reserved for this job')
             tips = self.store.observe_heads()
-            measured = measure_increment(self.store.path, candidate, tips, baseline_complete=True)
+            measured = self.measure(candidate, tips)
             self.validate_baseline_proof(baseline_complete, baseline_gate_version, dependency_coverage)
             amount = measured['compressed_object_upper_bound_bytes']
             self.charge(ledger['git_cost'], amount, item['initialization'], item['day'])
@@ -225,8 +233,10 @@ class Ledger:
                 raise ValueError('missing daily reservation')
             if item['status'] == 'settled':
                 return
-            if actual_bytes > item['reserved_bytes']:
-                raise ValueError('actual transfer exceeds reservation')
+            if type(actual_bytes) is not int or actual_bytes < 0:
+                raise ValueError('invalid actual transfer measurement')
+            item['transfer_observation'] = threshold_observation(
+                'http_job_bytes', actual_bytes, item['reserved_bytes'])
             item.update(charged_bytes=actual_bytes, requests=requests, completed_at=utcnow())
             intent = item.get('git_publication')
             if intent:
@@ -239,7 +249,7 @@ class Ledger:
                     # remains reserved across days; never refund on uncertainty.
                     intent['state'] = 'unresolved'
             item['status'] = 'settled' if not intent or intent['state'] == 'committed' else 'publication_unresolved'
-            actual_minutes = min(12, max(1, math.ceil(runner_seconds / 60))) if item['reserved_minutes'] else 0
+            actual_minutes = max(1, math.ceil(runner_seconds / 60)) if item['reserved_minutes'] else 0
             if 'runner_minutes' not in item and item['day'].startswith(ledger['runner_month']):
                 ledger['runner_minutes_used'] -= item['reserved_minutes'] - actual_minutes
             item['runner_minutes'] = actual_minutes
@@ -309,8 +319,7 @@ class Ledger:
         cost = ledger['git_cost']
         if not cost['baseline_completed_at']:
             raise ValueError('no completed baseline marker to correct')
-        if len(cost.get('baseline_corrections', [])) >= 4:
-            raise ValueError('bounded baseline correction history exhausted')
+        threshold_observation('baseline_correction_count', len(cost.get('baseline_corrections', [])) + 1, 4)
         before = cost['accounted_upper_bound_bytes']
         correction = {'at': utcnow(), 'data_commit': sha, 'invalidated_completed_at': cost['baseline_completed_at'],
             'replacement_completed_at': None, 'gate_version': 2, 'dependencies': evidence,

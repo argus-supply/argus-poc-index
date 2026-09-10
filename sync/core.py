@@ -10,6 +10,7 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator
 from .continuations import split_record, assemble_records, MAX_SNAPSHOT_LOGICAL_BYTES
+from .observations import threshold_observation
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -53,8 +54,8 @@ def load_policy(path):
     validate_policy(policy)
     if policy.get('git_cost_metric') != 'git-object-cost-v1' or policy.get('git_initialization_accounting') != 'separate':
         raise ValueError('unsupported Git accounting policy')
-    for key, low, high in (('git_control_max_bytes', 16384, 131072), ('git_control_reservation_margin_bytes', 64, 1024)):
-        if type(policy.get(key)) is not int or not low <= policy[key] <= high:
+    for key in ('git_control_max_bytes', 'git_control_reservation_margin_bytes'):
+        if type(policy.get(key)) is not int or policy[key] <= 0:
             raise ValueError('invalid Git accounting bound: ' + key)
     ceilings = {'max_record_bytes': 16384, 'max_shard_bytes': 524288,
         'max_tree_bytes': 33554432, 'job_seconds': 720, 'job_requests': 500,
@@ -62,9 +63,11 @@ def load_policy(path):
         'history_bytes': 134217728, 'monthly_history_growth_bytes': 104857600,
         'monthly_runner_minutes': 900, 'max_pocs_per_vulnerability': 100,
         'max_source_state_bytes': 524288}
-    for key, limit in ceilings.items():
-        if type(policy.get(key)) is not int or not 0 < policy[key] <= limit:
-            raise ValueError(f'invalid policy ceiling: {key}')
+    for key in ceilings:
+        if type(policy.get(key)) is not int or policy[key] <= 0:
+            raise ValueError(f'invalid policy threshold: {key}')
+    if policy['max_record_bytes'] > 16384:
+        raise ValueError('physical record protocol ceiling exceeded')
     if policy.get('schema_version') != '1.0' or not policy.get('policy_version'):
         raise ValueError('unsupported policy version')
     for key in ('retention_days', 'event_days', 'bootstrap_days', 'overlap_hours', 'reconcile_hours',
@@ -74,7 +77,7 @@ def load_policy(path):
     if policy['bootstrap_days'] > policy['retention_days']:
         raise ValueError('bootstrap exceeds retained window')
     allocations = policy['runner_minutes_by_repository']
-    if any(type(value) is not int or value <= 0 for value in allocations.values()) or sum(allocations.values()) > policy['monthly_runner_minutes']:
+    if any(type(value) is not int or value <= 0 for value in allocations.values()):
         raise ValueError('invalid per-repository runner allocation')
     if len(policy['source_order']) != len(set(policy['source_order'])):
         raise ValueError('duplicate source in fair collection order')
@@ -198,9 +201,7 @@ def apply_result(records, events, sources, source_id, result, now, policy):
     if invalid:
         # Restart the same source window; valid units converge by content hash.
         state = {**prior, **{k: state[k] for k in ('status', 'coverage_gaps', 'errors', 'last_attempt_at')}}
-    if len(canonical(state)) > policy['max_source_state_bytes']:
-        state = {**prior, 'status': 'partial', 'coverage_gaps': ['source_state_bytes_exceeded'],
-                 'errors': ['source_state_bytes_exceeded'], 'last_attempt_at': now}
+    threshold_observation('source_state_bytes', len(canonical(state)), policy['max_source_state_bytes'])
     sources[source_id] = state
 
 
@@ -231,7 +232,8 @@ def shard_rows(rows, kind, policy):
     keyfield = 'record_id' if kind == 'records' else 'event_id'
     def split(items, prefix):
         data = b''.join(canonical(item) for item in sorted(items, key=lambda item: item[keyfield]))
-        if len(data) <= policy['max_shard_bytes']:
+        if len(data) <= policy['max_shard_bytes'] or len(items) == 1:
+            threshold_observation('shard_bytes', len(data), policy['max_shard_bytes'])
             output[f'{kind}/{prefix}.jsonl'] = data
             return
         if len(prefix.rsplit('/', 1)[-1]) >= 64:
@@ -256,8 +258,8 @@ def shard_rows(rows, kind, policy):
 def build_snapshot(repository, records, events, sources, policy, now, collector_version,
                    previous=None, dependencies=None, extra=None):
     expire(records, events, now, policy)
-    if sum(len(canonical(row)) for row in records.values()) > MAX_SNAPSHOT_LOGICAL_BYTES:
-        raise ValueError('snapshot logical records exceed byte ceiling')
+    threshold_observation('snapshot_logical_bytes',
+        sum(len(canonical(row)) for row in records.values()), MAX_SNAPSHOT_LOGICAL_BYTES)
     physical = [item for row in records.values() for item in split_record(row, max_record_bytes=policy['max_record_bytes'])]
     files = {**shard_rows(physical, 'records', policy),
              **shard_rows(events.values(), 'events', policy)}
@@ -288,10 +290,8 @@ def build_snapshot(repository, records, events, sources, policy, now, collector_
             manifest = previous
     validate('manifest', manifest)
     files['manifest.json'] = canonical(manifest)
-    if len(files['manifest.json']) > 512 * 1024:
-        raise ValueError('manifest exceeds consumer 512 KiB bound')
-    if sum(map(len, files.values())) > policy['max_tree_bytes']:
-        raise ValueError('current data tree budget exceeded')
+    threshold_observation('manifest_bytes', len(files['manifest.json']), 512 * 1024)
+    threshold_observation('current_tree_bytes', sum(map(len, files.values())), policy['max_tree_bytes'])
     return files, manifest
 
 
@@ -312,7 +312,7 @@ def read_snapshot(files):
             kind = 'record' if shard['kind'] == 'records' else 'event'
             validate(kind, row)
             (records if kind == 'record' else events)[row[kind + '_id']] = row
-    logical = assemble_records(records)
+    logical = assemble_records(records, max_snapshot_logical_bytes=None)
     for row in logical:
         validate('record', row)
     return {row['record_id']: row for row in logical}, events, copy.deepcopy(manifest['sources']), manifest

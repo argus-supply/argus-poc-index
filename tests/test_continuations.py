@@ -7,7 +7,7 @@ from pathlib import Path
 import unittest
 
 from sync import continuations
-from sync.continuations import (assemble_records, join_record, split_record, AFFECTED_FORMAT,
+from sync.continuations import (assemble_records, iter_records, join_record, split_record, AFFECTED_FORMAT,
                                 COMPRESSED_FORMAT, COMPRESSED_AFFECTED_FORMAT,
                                 MAX_LOGICAL_BYTES, MAX_AFFECTED_BYTES, MAX_AFFECTED_PARTS)
 
@@ -116,7 +116,35 @@ class ContinuationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'snapshot logical records'):
             assemble_records(rows, max_snapshot_logical_bytes=len(encoded(original)) - 1)
         with self.assertRaisesRegex(ValueError, 'snapshot logical byte ceiling'):
-            assemble_records(rows, max_snapshot_logical_bytes=64 * 1024 * 1024 + 1)
+            assemble_records(rows, max_snapshot_logical_bytes=0)
+        self.assertEqual(assemble_records(rows, max_snapshot_logical_bytes=None), [original])
+
+    def test_streaming_records_above_previous_snapshot_target_keep_every_row(self):
+        original = record(100000)
+        count = 64 * 1024 * 1024 // len(encoded(original)) + 2
+        rows = []
+        for index in range(count):
+            row = {**original, 'record_id': f'cve/stream-{index:05d}'}
+            rows.extend(split_record(row))
+        logical = iter_records(rows, max_snapshot_logical_bytes=None)
+        self.assertIs(iter(logical), logical)
+        total, restored = 0, 0
+        for row in logical:
+            self.assertEqual(row['affected'], original['affected'])
+            self.assertEqual(row['content_hash'], original['content_hash'])
+            total += len(encoded(row))
+            restored += 1
+        self.assertEqual(restored, count)
+        self.assertGreater(total, 64 * 1024 * 1024)
+
+    def test_streaming_iteration_must_finish_to_validate_orphan_fragments(self):
+        original = record()
+        rows = split_record(original)
+        orphan = split_record({**original, 'record_id': 'cve/orphan'})[1]
+        stream = iter_records([*rows, orphan], max_snapshot_logical_bytes=None)
+        self.assertEqual(next(stream), original)
+        with self.assertRaisesRegex(ValueError, 'orphan'):
+            next(stream)
 
     def test_cve_assertion_storage_encoding_is_lossless_and_rejects_tampering(self):
         original = affected_record(100)

@@ -15,6 +15,7 @@ from .ledger import CostMigrationRequired
 from .http import BudgetExceeded, Http
 from .dependency import consume_intel
 from .availability import refresh as refresh_reference_availability
+from .observations import threshold_observation
 
 REPOSITORIES = ('argus-intel-data', 'argus-poc-index', 'argus-detection-resources')
 
@@ -106,8 +107,10 @@ def run(repository, remote, work, job_id, *, policy, token=None, manual=False, h
                 candidate_logical_record_bytes=sum(len(canonical(row)) for row in records.values()),
                 candidate_event_bytes=sum(len(canonical(row)) for row in events.values()),
                 candidate_manifest_bytes=len(files['manifest.json']))
-            if sum(map(len, files.values())) > policy['max_tree_bytes']:
-                raise ValueError('current data tree including dependency cache exceeds budget')
+            metrics['capacity_observations'] = [
+                threshold_observation('current_tree_bytes', sum(map(len, files.values())),
+                                      policy['max_tree_bytes']),
+                *client.capacity_observations]
             changed_bytes = sum(len(value) for key, value in files.items() if before_files.get(key) != value)
             baseline_complete = all(sources.get(item['id'], {}).get('status') == 'ok'
                 and sources[item['id']].get('completed_watermark')
@@ -142,9 +145,14 @@ def run(repository, remote, work, job_id, *, policy, token=None, manual=False, h
         metrics['error'] = {'code': type(error).__name__, 'message': str(error)[:180]}
         return metrics
     finally:
+        metrics.setdefault('capacity_observations', list(client.capacity_observations))
+        elapsed = round(time.monotonic() - started, 3)
+        metrics['capacity_observations'].append(threshold_observation(
+            'collector_elapsed_seconds', elapsed,
+            policy.get('job_target_seconds', policy['job_seconds'])))
         metrics.update(completed_at=utcnow(), upstream_bytes=client.bytes, upstream_requests=client.requests,
             decompressed_bytes=client.decompressed_bytes,
-            elapsed_seconds=round(time.monotonic() - started, 3))
+            elapsed_seconds=elapsed)
         health = {'schema_version': '1.0', 'updated_at': utcnow(), 'collection_status': metrics['status'],
             'data_commit': metrics['data_commit'], 'sources': {name: {key: value.get(key) for key in
                 ('status', 'last_attempt_at', 'last_success_at', 'coverage_gaps', 'errors')}
@@ -180,8 +188,9 @@ def main():
     policy = load_policy(ROOT / 'policy.json')
     if os.environ.get('ARGUS_COLLECT_SECONDS'):
         seconds = int(os.environ['ARGUS_COLLECT_SECONDS'])
-        if not 1 <= seconds <= policy['job_seconds']:
+        if not 1 <= seconds <= 21_000:
             raise ValueError('invalid collector time allocation')
+        policy['job_target_seconds'] = policy['job_seconds']
         policy['job_seconds'] = seconds
     job_id = os.environ.get('GITHUB_RUN_ID', 'local-' + str(time.time_ns())) + '-' + os.environ.get('GITHUB_RUN_ATTEMPT', '1')
     result = run(args.repository, 'https://github.com/argus-supply/' + args.repository + '.git', args.work,

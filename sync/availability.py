@@ -48,10 +48,18 @@ def refresh(records, previous, http, now, policy):
     ordered = sorted(eligible)
     cursor = state['cursor'] or ''
     ordered = [key for key in ordered if key > cursor] + [key for key in ordered if key <= cursor]
-    deferred, observed = False, 0
+    deferred, batched, observed = False, False, 0
     for key in ordered:
         if key in entries and instant(entries[key]['next_check_at']) > instant(now):
             continue
+        remaining = policy['reference_probe_requests'] - local.requests
+        if remaining <= 0:
+            batched = True
+            break
+        # This optional background batch never blocks fact collection or
+        # publication. Bound retries to its remaining scheduling slots.
+        local.policy = {**policy, 'reference_probe_retries':
+                        min(policy['reference_probe_retries'], remaining - 1)}
         try:
             status = local.head_reference(eligible[key])
             availability, reason = 'available', 'HEAD returned success; content and exploit effectiveness unverified'
@@ -81,6 +89,7 @@ def refresh(records, previous, http, now, policy):
     metrics = {'eligible_count': len(eligible), 'unsupported_count': unsupported,
         'retained_checks': len(entries), 'fresh_checks': fresh, 'pending_or_due': len(eligible) - fresh,
         'observed': observed, 'requests': local.requests, 'bytes': local.bytes,
-        'deferred_by_budget': deferred, 'checkpoint_bytes': len(canonical(state)),
+        'deferred_by_budget': deferred, 'deferred_by_batch': batched,
+        'checkpoint_bytes': len(canonical(state)),
         'coverage': 'complete' if fresh == len(eligible) and not unsupported else 'partial'}
     return state, metrics
