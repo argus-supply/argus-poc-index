@@ -9,7 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from jsonschema import Draft202012Validator
-from .continuations import split_record, assemble_records
+from .continuations import split_record, assemble_records, MAX_SNAPSHOT_LOGICAL_BYTES
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -256,6 +256,8 @@ def shard_rows(rows, kind, policy):
 def build_snapshot(repository, records, events, sources, policy, now, collector_version,
                    previous=None, dependencies=None, extra=None):
     expire(records, events, now, policy)
+    if sum(len(canonical(row)) for row in records.values()) > MAX_SNAPSHOT_LOGICAL_BYTES:
+        raise ValueError('snapshot logical records exceed byte ceiling')
     physical = [item for row in records.values() for item in split_record(row, max_record_bytes=policy['max_record_bytes'])]
     files = {**shard_rows(physical, 'records', policy),
              **shard_rows(events.values(), 'events', policy)}

@@ -155,7 +155,7 @@ class SourceContracts(unittest.TestCase):
         self.assertIsNone(result.completed_watermark)
         self.assertIn('oversize_record', result.errors[0]['message'])
 
-    def test_cve_large_affected_array_uses_lossless_v2_without_multiple_advisories(self):
+    def test_cve_large_affected_array_uses_lossless_compressed_v3_without_multiple_advisories(self):
         raw = cve('CVE-2026-12345')
         raw['containers']['cna']['affected'] = [{'vendor': 'fixture', 'product': f'platform-{index}',
             'versions': [{'version': f'{index}.0', 'lessThan': f'{index}.5', 'status': 'affected'}],
@@ -187,7 +187,7 @@ class SourceContracts(unittest.TestCase):
         physical = [json.loads(line) for descriptor in manifest['shards'] if descriptor['kind'] == 'records'
                     for line in files[descriptor['path']].splitlines()]
         parent = next(row for row in physical if row['kind'] != 'continuation')
-        self.assertEqual(parent['continuation']['format'], 'json-affected-v2')
+        self.assertEqual(parent['continuation']['format'], 'json-zlib-affected-v3')
         self.assertEqual(parent['continuation']['affected_count'], 2712)
         self.assertTrue(all(len(stored_json(row)) <= 16384 for row in physical))
 

@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 import urllib.error
+from unittest.mock import patch
 
 from sync.adapters import AdapterResult
 from sync.core import (ROOT, apply_result, build_snapshot, canonical, digest,
@@ -128,6 +129,12 @@ class CoreTests(unittest.TestCase):
         self.apply()
         self.policy['max_tree_bytes'] = 1
         with self.assertRaisesRegex(ValueError, 'tree budget'):
+            self.snapshot()
+
+    def test_a07_logical_snapshot_limit_raises_before_publication(self):
+        self.apply()
+        with patch('sync.core.MAX_SNAPSHOT_LOGICAL_BYTES', 1), self.assertRaisesRegex(
+                ValueError, 'logical records exceed'):
             self.snapshot()
 
     def test_a07_shards_split_stably_and_have_exact_hashes(self):

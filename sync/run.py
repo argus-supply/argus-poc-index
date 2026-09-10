@@ -102,6 +102,10 @@ def run(repository, remote, work, job_id, *, policy, token=None, manual=False, h
                 policy, now, version, previous, dependencies,
                 extra)
             files.update(dependency_files)
+            metrics.update(candidate_current_tree_bytes=sum(map(len, files.values())),
+                candidate_logical_record_bytes=sum(len(canonical(row)) for row in records.values()),
+                candidate_event_bytes=sum(len(canonical(row)) for row in events.values()),
+                candidate_manifest_bytes=len(files['manifest.json']))
             if sum(map(len, files.values())) > policy['max_tree_bytes']:
                 raise ValueError('current data tree including dependency cache exceeds budget')
             changed_bytes = sum(len(value) for key, value in files.items() if before_files.get(key) != value)
