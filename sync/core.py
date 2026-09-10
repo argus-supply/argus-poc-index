@@ -279,10 +279,13 @@ def build_snapshot(repository, records, events, sources, policy, now, collector_
         def comparable(value):
             value = copy.deepcopy(value)
             value.pop('created_at', None)
-            for state in value['sources'].values():
+            for source_id, state in value['sources'].items():
                 for key in ('last_attempt_at', 'last_success_at', 'requests', 'bytes', 'elapsed_seconds'):
                     state.pop(key, None)
-                if state.get('status') == 'ok' and not state.get('continuation'):
+                # A completed CVE Git revision is the next incremental base.
+                # Persist its checkpoint even when all normalized facts match,
+                # otherwise the following run replays the same changed files.
+                if source_id != 'cve' and state.get('status') == 'ok' and not state.get('continuation'):
                     for key in ('completed_watermark', 'revision', 'revision_history'):
                         state.pop(key, None)
             return value

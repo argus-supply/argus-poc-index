@@ -228,6 +228,175 @@ class SourceContracts(unittest.TestCase):
         self.assertEqual(result.records[0]['source_modified_at'], '2026-09-08T00:00:00Z')
         self.assertEqual(result.records[0]['affected'][0]['original_ranges'][0]['lessThan'], '1.4')
 
+    def test_cve_two_commit_thirteen_file_delta_uses_latest_completed_revision(self):
+        # The fixed revisions and 2-commit/13-file shape reproduce runs
+        # 34516254789/34517990532; advisory bodies are controlled fixtures.
+        baseline = 'a92308bd9728e7ed02eefc692887fb0afd62c228'
+        completed = '6d403fb6d79a26f352d8596d90121c8c91def8e7'
+        target = '28040e1d904e0ab6ee1d2cc006d77b3fc284fbec'
+        previous_time, now = '2026-09-10T18:46:07Z', '2026-09-10T19:03:21Z'
+        identifiers = [f'CVE-2026-{10000 + index}' for index in range(11)]
+        records, events, sources = {}, {}, {}
+        policy = load_policy(ROOT / 'policy.json')
+        history = [{'revision': baseline, 'at': '2026-09-09T02:43:38Z'},
+                   {'revision': completed, 'at': previous_time}]
+        initial = AdapterResult(status='ok', revision=completed, completed_watermark=previous_time,
+            records=[normalize_cve(cve(identifier), completed) for identifier in identifiers[:6]],
+            state={'revision_history': history})
+        apply_result(records, events, sources, 'cve', initial, previous_time, policy)
+        original_records, event_count = copy.deepcopy(records), len(events)
+        changed = [{'filename': cve_path(identifier)} for identifier in identifiers]
+        changed.extend([{'filename': 'cves/deltaLog.json'}, {'filename': 'README.md'}])
+
+        def handler(url):
+            if '/commits/HEAD' in url:
+                return {'sha': target}
+            if '/compare/' in url:
+                self.assertIn(completed + '...' + target, url)
+                return {'status': 'ahead', 'ahead_by': 2, 'total_commits': 2,
+                    'files': changed, 'commits': [{'sha': OLDER}, {'sha': target}]}
+            self.assertIn('/' + target + '/cves/', url)
+            self.assertNotIn('deltaLog.json', url)
+            identifier = url.rsplit('/', 1)[-1][:-5]
+            row = cve(identifier)
+            if identifier in identifiers[:3]:
+                row['cveMetadata']['dateUpdated'] = '2000-01-01T00:00:00Z'
+                row['containers']['cna']['affected'][0]['versions'][0]['lessThan'] = '1.4'
+            return row
+
+        http = HTTP(handler)
+        result = collect('cve', http, {'records': list(records.values()), 'state': sources['cve']},
+            now=now, policy=policy)
+        self.assertEqual(result.status, 'ok', result.errors)
+        self.assertEqual(len(http.urls), 13)  # HEAD + complete compare + 11 changed CVEs.
+        self.assertEqual(result.completed_watermark, now)
+        self.assertEqual(result.state['revision_history'][:2], history)
+        self.assertEqual(result.state['revision_history'][-1], {'revision': target, 'at': now})
+        apply_result(records, events, sources, 'cve', result, now, policy)
+        self.assertEqual(len(records) - len(original_records), 5)
+        self.assertEqual(len(events) - event_count, 8)
+        for identifier in identifiers[:3]:
+            self.assertEqual(records['cve/' + identifier]['source_modified_at'], '2000-01-01T00:00:00Z')
+        for identifier in identifiers[3:6]:
+            self.assertEqual(records['cve/' + identifier], original_records['cve/' + identifier])
+
+        def later(url):
+            if '/commits/HEAD' in url:
+                return {'sha': REV}
+            self.assertIn('/compare/' + target + '...' + REV, url)
+            return {'status': 'ahead', 'total_commits': 1, 'files': [{'filename': 'README.md'}]}
+        later_http = HTTP(later)
+        next_result = collect('cve', later_http, {'records': list(records.values()), 'state': sources['cve']},
+            now='2026-09-10T19:20:00Z', policy=policy)
+        self.assertEqual(next_result.status, 'ok')
+        self.assertEqual(next_result.records, [])
+        self.assertEqual(len(later_http.urls), 2)
+
+    def test_cve_force_push_or_unavailable_latest_base_cannot_hide_behind_old_ancestor(self):
+        history = [{'revision': 'd' * 40, 'at': '2026-09-07T12:00:00Z'},
+                   {'revision': OLDER, 'at': '2026-09-08T01:00:00Z'}]
+        previous = {'records': [normalize_cve(cve(), OLDER)], 'state': {'status': 'ok',
+            'revision': OLDER, 'completed_watermark': history[-1]['at'], 'revision_history': history}}
+        original = copy.deepcopy(previous)
+        for status in ('behind', 'diverged', 'missing-base'):
+            def handler(url):
+                if '/commits/HEAD' in url:
+                    return {'sha': REV}
+                self.assertIn('/compare/' + OLDER + '...' + REV, url)
+                if status == 'missing-base':
+                    raise FetchError('upstream HTTP 404', status=404)
+                return {'status': status, 'files': [], 'total_commits': 1}
+            http = HTTP(handler)
+            result = collect('cve', http, previous, now=NOW, policy={})
+            with self.subTest(status=status):
+                self.assertEqual(result.status, 'partial')
+                self.assertEqual(result.records, [])
+                self.assertEqual(result.completed_watermark, history[-1]['at'])
+                self.assertEqual(result.state['revision_history'], history)
+                self.assertEqual(result.continuation['base_revision'], OLDER)
+                self.assertEqual(http.urls[-1].split('/compare/')[1].split('?')[0], OLDER + '...' + REV)
+                self.assertEqual(len(http.urls), 2)
+                self.assertTrue(result.errors)
+                self.assertTrue(result.coverage_gaps)
+                self.assertEqual(previous, original)
+
+    def test_cve_legacy_inflight_compare_keeps_original_base_and_offset(self):
+        baseline, completed = 'd' * 40, OLDER
+        previous = {'state': {'status': 'partial', 'revision': REV,
+            'completed_watermark': '2026-09-08T01:00:00Z',
+            'revision_history': [{'revision': baseline, 'at': '2026-09-07T12:00:00Z'},
+                                 {'revision': completed, 'at': '2026-09-08T01:00:00Z'}],
+            'continuation': {'revision': REV, 'base_revision': baseline,
+                'window_end': NOW, 'change_offset': 1}}}
+        def handler(url):
+            self.assertNotIn('/commits/HEAD', url)
+            if '/compare/' in url:
+                self.assertIn(baseline + '...' + REV, url)
+                return {'status': 'ahead', 'files': [{'filename': cve_path('CVE-2026-10000')},
+                    {'filename': cve_path('CVE-2026-10001')}]}
+            self.assertTrue(url.endswith('/CVE-2026-10001.json'))
+            return cve('CVE-2026-10001')
+        http = HTTP(handler)
+        result = collect('cve', http, previous, now='2026-09-09T02:00:00Z', policy={})
+        self.assertEqual(result.status, 'ok', result.errors)
+        self.assertEqual(result.completed_watermark, NOW)
+        self.assertEqual([row['native_id'] for row in result.records], ['CVE-2026-10001'])
+        self.assertEqual(len(http.urls), 2)
+        self.assertIsNone(result.continuation)
+
+    def test_cve_metadata_only_completion_persists_base_for_next_head_and_same_sha_is_noop(self):
+        first_time, second_time = '2026-09-08T01:00:00Z', '2026-09-08T02:00:00Z'
+        third_time, last_time = '2026-09-08T03:00:00Z', '2026-09-08T04:00:00Z'
+        latest = 'c' * 40
+        policy = load_policy(ROOT / 'policy.json')
+        records, events, sources = {}, {}, {}
+        initial = AdapterResult(status='ok', revision=OLDER, completed_watermark=first_time,
+            records=[normalize_cve(cve(), OLDER)],
+            state={'revision_history': [{'revision': OLDER, 'at': first_time}]})
+        apply_result(records, events, sources, 'cve', initial, first_time, policy)
+        original, _ = build_snapshot('argus-supply/argus-intel-data', records, events, sources,
+                                      policy, first_time, 'fixture')
+
+        def cycle(files, target, now, raw, expected_base):
+            old_records, old_events, old_sources, manifest = read_snapshot(files)
+            def handler(url):
+                if '/commits/HEAD' in url:
+                    return {'sha': target}
+                if '/compare/' in url:
+                    self.assertIn(expected_base + '...' + target, url)
+                    return {'status': 'ahead', 'total_commits': 1,
+                            'files': [{'filename': cve_path(raw['cveMetadata']['cveId'])}]}
+                self.assertIn('/' + target + '/cves/', url)
+                return raw
+            http = HTTP(handler)
+            result = collect('cve', http, {'records': list(old_records.values()), 'state': old_sources['cve']},
+                             now=now, policy=policy)
+            self.assertEqual(result.status, 'ok', result.errors)
+            apply_result(old_records, old_events, old_sources, 'cve', result, now, policy)
+            updated, updated_manifest = build_snapshot('argus-supply/argus-intel-data', old_records,
+                old_events, old_sources, policy, now, 'fixture', manifest)
+            return updated, updated_manifest, http
+
+        metadata_only = cve()
+        metadata_only['cveMetadata']['dateUpdated'] = second_time
+        second, second_manifest, http = cycle(original, REV, second_time, metadata_only, OLDER)
+        self.assertEqual(len(http.urls), 3)
+        self.assertNotEqual(second['manifest.json'], original['manifest.json'])
+        self.assertEqual({p: b for p, b in second.items() if p != 'manifest.json'},
+                         {p: b for p, b in original.items() if p != 'manifest.json'})
+        self.assertEqual(second_manifest['sources']['cve']['revision'], REV)
+        self.assertEqual(second_manifest['sources']['cve']['completed_watermark'], second_time)
+        self.assertEqual(second_manifest['sources']['cve']['revision_history'][-1],
+                         {'revision': REV, 'at': second_time})
+
+        third, third_manifest, http = cycle(second, latest, third_time, cve('CVE-2026-10001'), REV)
+        self.assertEqual(len(http.urls), 3)
+        self.assertEqual(len(read_snapshot(third)[0]), 2)
+        same, same_manifest, http = cycle(third, latest, last_time, None, latest)
+        self.assertEqual(len(http.urls), 1)
+        self.assertEqual(same, third)
+        self.assertEqual(same_manifest, third_manifest)
+
     def old_bootstrap(self, *, material=False, absent_baseline=False, already_retained=False, rejected_unpublished=False):
         current = cve()
         current['cveMetadata']['datePublished'] = '2000-01-01T00:00:00Z'
@@ -429,16 +598,20 @@ class SourceContracts(unittest.TestCase):
             if '/commits/HEAD' in url:
                 return {'sha': REV}
             if '/compare/' in url:
+                self.assertIn(OLDER + '...' + REV, url)
                 return {'status': 'ahead', 'files': [{'filename': 'cves/deltaLog.json'}] * 300,
                     'total_commits': 1, 'commits': [{'sha': REV}]}
             if '/commits/'+REV in url:
                 return {'files': [{'filename': cve_path('CVE-2020-1234')}, {'filename': cve_path('CVE-2020-1235')}]}
             return cve(url.rsplit('/', 1)[-1][:-5])
         previous = {'records': [], 'state': {'status': 'ok', 'revision': OLDER,
-            'completed_watermark': '2026-09-08T01:00:00Z'}}
+            'completed_watermark': '2026-09-08T01:00:00Z',
+            'revision_history': [{'revision': 'd' * 40, 'at': '2026-09-07T12:00:00Z'},
+                                 {'revision': OLDER, 'at': '2026-09-08T01:00:00Z'}]}}
         first = collect('cve', HTTP(handler), previous, now=NOW, policy={'adapter_max_units': 2})
         self.assertEqual(first.status, 'partial')
         self.assertEqual(first.continuation['file_offset'], 1)
+        self.assertEqual(first.continuation['base_revision'], OLDER)
         self.assertEqual(first.completed_watermark, previous['state']['completed_watermark'])
         final = collect('cve', HTTP(handler), {'state': first.state, 'records': first.records}, now=NOW, policy={})
         self.assertEqual(final.status, 'ok')

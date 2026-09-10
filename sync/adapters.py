@@ -548,7 +548,8 @@ class Run:
             if not history or history[-1]['revision'] != revision:
                 history.append({'revision': revision, 'at': self.result.completed_watermark})
             cutoff = timestamp(self.now) - timedelta(hours=self.policy.get('overlap_hours', 48))
-            # Retain one boundary revision older than the overlap as its base.
+            # Retain completed revision evidence across the overlap window.
+            # Incremental Git comparisons start at the latest completed entry.
             while len(history) > 1 and timestamp(history[1]['at']) < cutoff:
                 history.pop(0)
             self.state['revision_history'] = history
@@ -716,11 +717,15 @@ class Run:
             history.update(page=history['page'] + 1, offset=0)
 
     def cve_changes(self, revision):
-        """Complete Git changes capture late source timestamps; overlap uses old heads."""
+        """Compare from the last completed state, independent of source timestamps."""
         repo = REPOS['cve']
         if 'base_revision' not in self.cursor:
             history = self.old.get('revision_history', [])
-            base = history[0]['revision'] if history else self.old['revision']
+            # Git's complete diff already includes late/rewritten source dates.
+            # Reusing the oldest overlap revision repeats previously applied
+            # files and can hide a force-push after the latest completed head.
+            # An in-flight cursor keeps its original base until fully consumed.
+            base = history[-1]['revision'] if history else self.old['revision']
             self.cursor.update(base_revision=base, window_end=self.now, change_offset=0)
         base = self.cursor['base_revision']
         if not SHA.fullmatch(base):
