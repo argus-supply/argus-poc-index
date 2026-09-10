@@ -877,6 +877,113 @@ class SourceContracts(unittest.TestCase):
         origins = [x['reference']['assertion_role'] for x in result.records[0]['provenance'] if 'reference' in x]
         self.assertEqual(origins, ['cna', 'adp'])
 
+    def test_official_malformed_microsoft_url_at_offset_878_does_not_block_valid_references(self):
+        broken = 'https:/www.microsoft.com/security/CVE-2026-48710'
+        valid = 'https://www.microsoft.com/security/CVE-2026-48710'
+        advisory = normalize_cve(cve('CVE-2026-48710'), REV)
+        advisory['references'] = [{'url': broken}, {'url': valid, 'name': 'Vendor advisory'}]
+        later = normalize_cve(cve('CVE-2026-48711'), REV)
+        later['references'] = [{'url': 'https://example.org/later'}]
+        prefix = [dict(advisory, record_id=f'cve/earlier-{index}', references=[]) for index in range(878)]
+        dep = dependency([*prefix, advisory, later])
+        original = copy.deepcopy(dep)
+        previous = {'state': {'status': 'partial', 'revision': REV,
+            'continuation': {'intel_commit_sha': REV, 'offset': 878}}}
+        result = collect('official-references', HTTP(lambda url: self.fail('reference fetched')), previous,
+            now=NOW, policy={}, dependency=dep)
+        self.assertEqual(result.status, 'ok')
+        self.assertEqual(result.completed_watermark, NOW)
+        self.assertIsNone(result.continuation)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.coverage_gaps, [])
+        self.assertEqual({row['url'] for row in result.records}, {valid, 'https://example.org/later'})
+        self.assertEqual(dep, original)
+        self.assertEqual(result.state['reference_validation'], {
+            'schema_version': '1.0', 'intel_commit_sha': REV, 'excluded_reference_count': 1,
+            'excluded_references': [{'record_id': 'cve/CVE-2026-48710', 'reference_index': 0,
+                'url_sha256': hashlib.sha256(broken.encode()).hexdigest(),
+                'reason': 'missing_url_host', 'disposition': 'not_indexed'}]})
+        self.assertNotIn(broken, json.dumps(result.state))
+        records, events, sources = {}, {}, {}
+        policy = load_policy(ROOT / 'policy.json')
+        apply_result(records, events, sources, 'official-references', result, NOW, policy)
+        files, _ = build_snapshot('argus-supply/argus-poc-index', records, events, sources,
+                                  policy, NOW, 'official-reference-validation')
+        restored, _, saved_sources, _ = read_snapshot(files)
+        self.assertEqual(restored, records)
+        self.assertEqual(saved_sources['official-references']['reference_validation'],
+                         result.state['reference_validation'])
+        self.assertEqual(saved_sources['official-references']['completed_watermark'], NOW)
+
+    def test_official_invalid_references_are_diagnosed_without_indexing_or_raw_urls(self):
+        advisory = normalize_cve(cve(), REV)
+        invalid = ['javascript:alert(1)', 'https://user:secret@example.org/advisory',
+            'https://example.org:invalid/advisory', 'https://example.org:0/advisory',
+            'https://example.org:/advisory', 'https://[broken/advisory',
+            'https://example.org/with space', '\nhttps://example.org/advisory',
+            'https://example.org\\@other.example/advisory', 'https://127.0.0.1/advisory',
+            'https://[::1]/advisory', 'https://host.local/advisory', 'https://localhost/advisory',
+            'https://2130706433/advisory', 'https://%31%32%37.0.0.1/advisory', None, 42]
+        advisory['references'] = [*({'url': url} for url in invalid), {}, None]
+        dep = dependency([advisory])
+        original = copy.deepcopy(dep)
+        result = collect('official-references', HTTP(lambda url: self.fail('reference fetched')), {},
+            now=NOW, policy={}, dependency=dep)
+        self.assertEqual(result.status, 'ok')
+        self.assertEqual(result.records, [])
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.coverage_gaps, [])
+        self.assertEqual(result.completed_watermark, NOW)
+        self.assertIsNone(result.continuation)
+        self.assertEqual(dep, original)
+        validation = result.state['reference_validation']
+        self.assertEqual(validation['excluded_reference_count'], len(invalid) + 2)
+        self.assertEqual(len(validation['excluded_references']), len(invalid) + 2)
+        for item in validation['excluded_references']:
+            self.assertEqual(set(item), {'record_id', 'reference_index', 'url_sha256', 'reason', 'disposition'})
+            self.assertEqual(len(item['url_sha256']), 64)
+            self.assertEqual(item['disposition'], 'not_indexed')
+        self.assertNotIn('secret', json.dumps(result.state))
+        self.assertNotIn('https://', json.dumps(result.state))
+
+    def test_official_reference_diagnostics_survive_interrupted_unit_without_duplicates(self):
+        advisory = normalize_cve(cve(), REV)
+        advisory['references'] = [{'url': 'https:/example.org/broken'}, {'url': 'https://example.org/valid'}]
+        dep = dependency([advisory])
+        with patch.object(Run, 'add', side_effect=ValueError('fixture unit interrupted')):
+            first = collect('official-references', HTTP(lambda url: self.fail('unexpected fetch')), {},
+                now=NOW, policy={}, dependency=dep)
+        self.assertEqual(first.status, 'partial')
+        self.assertEqual(first.continuation.get('offset', 0), 0)
+        self.assertIsNone(first.completed_watermark)
+        validation = copy.deepcopy(first.state['reference_validation'])
+        recovered = collect('official-references', HTTP(lambda url: self.fail('unexpected fetch')),
+            {'state': first.state}, now=NOW, policy={}, dependency=dep)
+        self.assertEqual(recovered.status, 'ok')
+        self.assertEqual(len(recovered.records), 1)
+        self.assertEqual(recovered.state['reference_validation'], validation)
+        self.assertEqual(recovered.errors, [])
+        self.assertEqual(recovered.coverage_gaps, [])
+        with patch.object(Run, 'unit', side_effect=AssertionError('completed snapshot rescanned')):
+            repeated = collect('official-references', HTTP(lambda url: self.fail('unexpected fetch')),
+                {'state': recovered.state}, now=NOW, policy={}, dependency=dep)
+        self.assertEqual(repeated.state['reference_validation'], validation)
+        self.assertEqual(repeated.status, 'ok')
+
+    def test_official_new_snapshot_validation_is_scoped_to_its_immutable_revision(self):
+        advisory = normalize_cve(cve(), REV)
+        advisory['references'] = [{'url': 'https:/example.org/broken'}]
+        first = collect('official-references', HTTP(lambda url: self.fail('unexpected fetch')), {},
+            now=NOW, policy={}, dependency=dependency([advisory]))
+        fixed = {**advisory, 'references': [{'url': 'https://example.org/fixed'}]}
+        result = collect('official-references', HTTP(lambda url: self.fail('unexpected fetch')),
+            {'state': first.state}, now=NOW, policy={}, dependency={**dependency([fixed]), 'commit_sha': OLDER})
+        self.assertEqual(result.status, 'ok')
+        self.assertEqual(len(result.records), 1)
+        self.assertEqual(result.state['reference_validation']['intel_commit_sha'], OLDER)
+        self.assertEqual(result.state['reference_validation']['excluded_references'], [])
+        self.assertEqual(first.state['reference_validation']['excluded_reference_count'], 1)
+
     def test_official_completed_same_sha_clears_redundant_partial_cursor_without_units(self):
         previous = {'state': {'status': 'partial', 'revision': REV, 'completed_watermark': NOW,
             'last_success_at': NOW, 'continuation': {'intel_commit_sha': REV, 'offset': 400},

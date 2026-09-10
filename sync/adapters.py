@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import csv
 import hashlib
+import ipaddress
 import io
 import json
 import re
@@ -80,6 +81,46 @@ def public_url(value):
     parsed = urlsplit(value)
     if parsed.scheme not in ('https', 'http') or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError('invalid public reference URL')
+    return value
+
+
+def official_reference_url(value):
+    """Validate a reference for indexing without repairing it or resolving hosts."""
+    if not isinstance(value, str):
+        raise ValueError('url_not_string')
+    if not value or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError('url_contains_whitespace_or_control')
+    if '\\' in value:
+        raise ValueError('url_contains_backslash')
+    try:
+        parsed = urlsplit(value)
+        host, port = parsed.hostname, parsed.port
+    except ValueError:
+        raise ValueError('malformed_url') from None
+    if parsed.scheme not in ('http', 'https'):
+        raise ValueError('unsupported_url_scheme')
+    if not host or not parsed.netloc:
+        raise ValueError('missing_url_host')
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError('url_contains_credentials')
+    if port == 0 or parsed.netloc.endswith(':'):
+        raise ValueError('invalid_url_port')
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            hostname = host.encode('idna').decode('ascii').rstrip('.').lower()
+        except UnicodeError:
+            raise ValueError('invalid_url_host') from None
+        labels = hostname.split('.')
+        if (len(labels) < 2 or len(hostname) > 253 or labels[-1].isdigit()
+                or any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label) for label in labels)):
+            raise ValueError('invalid_url_host')
+        if hostname.endswith(('.localhost', '.local', '.internal')):
+            raise ValueError('non_public_url_host')
+    else:
+        if not address.is_global:
+            raise ValueError('non_public_url_host')
     return value
 
 
@@ -1082,11 +1123,38 @@ class Run:
             # scanning this same SHA is redundant, even if it reports partial.
             self.finish(intel_sha, watermark=self.old['completed_watermark'])
             return
+        validation = self.state.get('reference_validation', {})
+        if validation.get('intel_commit_sha') != intel_sha:
+            validation = {'schema_version': '1.0', 'intel_commit_sha': intel_sha,
+                          'excluded_reference_count': 0, 'excluded_references': []}
+        self.state['reference_validation'] = validation
+        diagnosed = {(item['record_id'], item['reference_index'], item['url_sha256'])
+                     for item in validation['excluded_references']}
         for index in range(self.cursor.get('offset', 0), len(intel)):
             self.unit()
             advisory = intel[index]
-            for ref in advisory.get('references', []):
-                url = public_url(ref['url'])
+            for reference_index, ref in enumerate(advisory.get('references', [])):
+                value = ref.get('url') if isinstance(ref, dict) else None
+                try:
+                    if not isinstance(ref, dict):
+                        raise ValueError('reference_not_object')
+                    if 'url' not in ref:
+                        raise ValueError('missing_reference_url')
+                    url = official_reference_url(value)
+                except ValueError as error:
+                    body = value.encode('utf-8') if isinstance(value, str) else canonical(value)
+                    url_hash = hashlib.sha256(body).hexdigest()
+                    identity = (advisory['record_id'], reference_index, url_hash)
+                    if identity not in diagnosed:
+                        validation['excluded_references'].append({'record_id': advisory['record_id'],
+                            'reference_index': reference_index, 'url_sha256': url_hash,
+                            'reason': str(error), 'disposition': 'not_indexed'})
+                        diagnosed.add(identity)
+                        validation['excluded_reference_count'] = len(validation['excluded_references'])
+                    # The immutable intel record retains the complete original
+                    # fact. Excluding an invalid link is a completed validation
+                    # decision, not a missing source page or coverage gap.
+                    continue
                 # These are explicitly attributed references, never an invented
                 # claim that the site hosts a working PoC or vendor endorsement.
                 native = hashlib.sha256((advisory['record_id'] + '\0' + url).encode()).hexdigest()
