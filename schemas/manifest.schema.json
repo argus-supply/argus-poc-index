@@ -1,0 +1,324 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "repository",
+    "generation_id",
+    "policy_version",
+    "collector_version",
+    "created_at",
+    "shards",
+    "sources",
+    "retention",
+    "dependencies"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "repository": {
+      "type": "string"
+    },
+    "generation_id": {
+      "type": "string"
+    },
+    "policy_version": {
+      "type": "string"
+    },
+    "collector_version": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": "string"
+    },
+    "shards": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "path",
+          "kind",
+          "count",
+          "bytes",
+          "sha256"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "pattern": "^(records|events|checkpoints|deltas)/[a-zA-Z0-9/_.-]+\\.jsonl$"
+          },
+          "kind": {
+            "enum": [
+              "records",
+              "events"
+            ]
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "operation": {
+            "enum": [
+              "snapshot",
+              "upsert",
+              "delete",
+              "append"
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "sources": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "status",
+          "coverage_gaps",
+          "errors"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "ok",
+              "partial",
+              "failed",
+              "uninitialized"
+            ]
+          },
+          "revision": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_attempt_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_success_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "completed_watermark": {},
+          "continuation": {},
+          "coverage_gaps": {
+            "type": "array"
+          },
+          "errors": {
+            "type": "array"
+          }
+        }
+      }
+    },
+    "retention": {
+      "type": "object",
+      "required": [
+        "days",
+        "event_days",
+        "event_start_at"
+      ]
+    },
+    "dependencies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "repository",
+          "commit_sha",
+          "manifest_sha256"
+        ],
+        "properties": {
+          "repository": {
+            "type": "string"
+          },
+          "commit_sha": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{40}$"
+          },
+          "manifest_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        }
+      }
+    },
+    "reference_availability": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "method",
+        "scope",
+        "cursor",
+        "eligible_count",
+        "unsupported_count",
+        "entries"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "method": {
+          "const": "HEAD"
+        },
+        "scope": {
+          "const": "github-repository-and-exploitdb-id"
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "eligible_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unsupported_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "entries": {
+          "type": "object",
+          "maxProperties": 256,
+          "propertyNames": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "url_sha256",
+              "availability",
+              "checked_at",
+              "next_check_at",
+              "http_status",
+              "reason"
+            ],
+            "properties": {
+              "url_sha256": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              "availability": {
+                "enum": [
+                  "available",
+                  "temporarily-unavailable",
+                  "unknown"
+                ]
+              },
+              "checked_at": {
+                "type": "string",
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$",
+                "maxLength": 20
+              },
+              "next_check_at": {
+                "type": "string",
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$",
+                "maxLength": 20
+              },
+              "http_status": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 100,
+                "maximum": 599
+              },
+              "reason": {
+                "type": "string",
+                "maxLength": 120
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "storage": {
+      "type": "object",
+      "required": [
+        "format",
+        "checkpoint",
+        "deltas"
+      ],
+      "properties": {
+        "format": {
+          "const": "checkpoint-delta-v1"
+        },
+        "checkpoint": {
+          "type": "object",
+          "required": [
+            "id",
+            "created_at",
+            "shards"
+          ],
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "created_at": {
+              "type": "string"
+            },
+            "shards": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            }
+          },
+          "additionalProperties": false
+        },
+        "deltas": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "run_id",
+              "created_at",
+              "shards"
+            ],
+            "properties": {
+              "run_id": {
+                "type": "string"
+              },
+              "created_at": {
+                "type": "string"
+              },
+              "shards": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "uniqueItems": true
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
