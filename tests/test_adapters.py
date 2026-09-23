@@ -15,6 +15,7 @@ from sync.adapters import (AdapterResult, CVE, Run, collect, cve_path, normalize
                            normalize_nuclei_aggregate, NUCLEI_AGGREGATE, NUCLEI_AGGREGATE_MAX_BYTES,
                            NUCLEI_AGGREGATE_MAX_MATCHERS, raw_url)
 from sync.core import ROOT, apply_result, build_snapshot, canonical as stored_json, load_policy, read_snapshot
+from sync.continuations import split_record
 from sync.gitstore import GitStore
 from sync.http import BudgetExceeded, FetchError, Http
 from sync.run import run as run_collector
@@ -155,14 +156,38 @@ class SourceContracts(unittest.TestCase):
         self.assertEqual(len(second.records), 2)
         self.assertEqual(sum('/commits/HEAD' in u for u in http.urls), 1)
 
-    def test_cve_oversize_keeps_ranges_and_watermark_before_failed_unit(self):
+    def test_cve_large_nested_ranges_use_v4_and_advance_watermark(self):
         huge = cve()
         huge['containers']['cna']['affected'][0]['versions'] = [{'version': str(x), 'status': 'affected'} for x in range(10000)]
         def handler(url):
             if '/commits/HEAD' in url:
                 return {'sha': REV}
             if url.endswith('deltaLog.json'):
-                return [{'fetchTime': '2026-09-08T00:00:00Z', 'new': [{'cveId': 'CVE-2020-1234'}], 'updated': []}]
+                return [{'fetchTime': '2026-09-08T00:00:00Z',
+                         'new': [{'cveId': 'CVE-2020-1234'}], 'updated': []},
+                        {'fetchTime': '2026-08-01T00:00:00Z', 'new': [], 'updated': []}]
+            return huge
+        policy = load_policy(ROOT / 'policy.json')
+        result = collect('cve', HTTP(handler), {}, now=NOW,
+                         policy={**policy, 'bootstrap_days': 30})
+        self.assertEqual(result.status, 'ok', result.errors)
+        self.assertEqual(len(result.records), 1)
+        self.assertEqual(len(result.records[0]['affected'][0]['original_ranges']), 10000)
+        self.assertEqual(result.completed_watermark, NOW)
+        physical = split_record({**result.records[0], 'content_hash': '0' * 64,
+                                 'first_seen_at': NOW})
+        self.assertEqual(physical[0]['continuation']['format'],
+                         'json-zlib-affected-ranges-v4')
+
+    def test_cve_unbounded_non_range_field_keeps_watermark_before_failed_unit(self):
+        huge = cve()
+        huge['containers']['cna']['affected'][0]['product'] = 'x' * 300000
+        def handler(url):
+            if '/commits/HEAD' in url:
+                return {'sha': REV}
+            if url.endswith('deltaLog.json'):
+                return [{'fetchTime': '2026-09-08T00:00:00Z',
+                         'new': [{'cveId': 'CVE-2020-1234'}], 'updated': []}]
             return huge
         result = collect('cve', HTTP(handler), {}, now=NOW, policy={})
         self.assertEqual(result.status, 'partial')

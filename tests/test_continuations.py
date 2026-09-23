@@ -9,6 +9,7 @@ import unittest
 from sync import continuations
 from sync.continuations import (assemble_records, iter_records, join_record, split_record, AFFECTED_FORMAT,
                                 COMPRESSED_FORMAT, COMPRESSED_AFFECTED_FORMAT,
+                                COMPRESSED_AFFECTED_RANGES_FORMAT,
                                 MAX_LOGICAL_BYTES, MAX_AFFECTED_BYTES, MAX_AFFECTED_PARTS)
 
 
@@ -38,6 +39,13 @@ def affected_record(count=2712):
     return result
 
 
+def affected_ranges_record(count=7989):
+    result = record(1)
+    result['affected'] = [{'product': 'range-heavy-platform', 'original_ranges': [
+        {'version': str(index), 'status': 'affected'} for index in range(count)]}]
+    return result
+
+
 def forged_affected_bundle(logical):
     """Make hash-consistent hostile bytes to exercise consumer semantic validation."""
     data = encoded(logical)
@@ -52,6 +60,40 @@ def forged_affected_bundle(logical):
 
 
 class ContinuationTests(unittest.TestCase):
+    def test_affected_ranges_v4_preserves_one_large_nested_range_array(self):
+        original = affected_ranges_record()
+        self.assertGreater(len(encoded(original['affected'][0])), MAX_LOGICAL_BYTES)
+        self.assertLess(len(encoded({**original['affected'][0], 'original_ranges': []})),
+                        MAX_LOGICAL_BYTES)
+        rows = split_record(original)
+        descriptor = rows[0]['continuation']
+        self.assertEqual(descriptor['format'], COMPRESSED_AFFECTED_RANGES_FORMAT)
+        self.assertEqual(descriptor['affected_count'], 1)
+        self.assertLessEqual(len(rows) - 1, MAX_AFFECTED_PARTS)
+        self.assertTrue(all(len(encoded(row)) <= 16384 for row in rows))
+        self.assertEqual(assemble_records(rows), [original])
+
+    def test_affected_ranges_v4_only_relaxes_bounded_original_range_lists(self):
+        for mode in ('huge-base', 'huge-range', 'non-list', 'non-object', 'total'):
+            with self.subTest(mode=mode):
+                original = affected_ranges_record()
+                if mode == 'huge-base':
+                    original['affected'][0]['product'] = 'x' * (MAX_LOGICAL_BYTES + 1)
+                elif mode == 'huge-range':
+                    original['affected'][0]['original_ranges'] = [
+                        {'version': 'x' * (MAX_LOGICAL_BYTES + 1)}]
+                elif mode == 'non-list':
+                    original['affected'][0]['original_ranges'] = 'x' * (MAX_LOGICAL_BYTES + 1)
+                elif mode == 'non-object':
+                    original['affected'][0]['original_ranges'] = ['x' * 64] * 7989
+                else:
+                    original['affected'][0]['original_ranges'] = [
+                        {'version': str(index), 'expression': 'x' * 256}
+                        for index in range(8000)]
+                    self.assertGreater(len(encoded(original)), MAX_AFFECTED_BYTES)
+                with self.assertRaisesRegex(ValueError, 'logical record exceeds'):
+                    split_record(original)
+
     def test_affected_v2_preserves_every_entry_assertion_index_and_identity(self):
         original = affected_record()
         self.assertGreater(len(encoded(original)), MAX_LOGICAL_BYTES)

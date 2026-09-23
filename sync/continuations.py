@@ -19,6 +19,8 @@ FORMAT = 'json-utf8-v1'
 AFFECTED_FORMAT = 'json-affected-v2'
 COMPRESSED_FORMAT = 'json-zlib-v3'
 COMPRESSED_AFFECTED_FORMAT = 'json-zlib-affected-v3'
+AFFECTED_RANGES_FORMAT = 'json-affected-ranges-v4'
+COMPRESSED_AFFECTED_RANGES_FORMAT = 'json-zlib-affected-ranges-v4'
 COMPRESSION_LEVEL = 6
 STORAGE_FORMAT = 'cve-indexed-assertions-v1'
 MAX_RECORD_BYTES = 16 * 1024
@@ -208,16 +210,30 @@ def _expand_record(record):
 
 
 def _format(record, size, max_logical_bytes):
-    """Only an array of individually bounded advisory assertions may use v2."""
+    """Select a bounded format for ordinary or nested advisory arrays."""
     if size <= max_logical_bytes:
         return FORMAT
     affected = record.get('affected')
     if (size > MAX_AFFECTED_BYTES or record.get('kind') != 'advisory'
             or not isinstance(affected, list) or not affected
-            or any(not isinstance(item, dict) or len(_canonical(item)) > max_logical_bytes for item in affected)
             or len(_canonical({**record, 'affected': []})) > max_logical_bytes):
         raise ValueError('logical record exceeds continuation byte ceiling outside bounded affected-array format')
-    return AFFECTED_FORMAT
+    oversized = []
+    for item in affected:
+        if not isinstance(item, dict):
+            raise ValueError('logical record exceeds continuation byte ceiling outside bounded affected-array format')
+        if len(_canonical(item)) > max_logical_bytes:
+            oversized.append(item)
+    if not oversized:
+        return AFFECTED_FORMAT
+    for item in oversized:
+        ranges = item.get('original_ranges')
+        if (not isinstance(ranges, list) or not ranges
+                or len(_canonical({**item, 'original_ranges': []})) > max_logical_bytes
+                or any(not isinstance(entry, dict)
+                       or len(_canonical(entry)) > max_logical_bytes for entry in ranges)):
+            raise ValueError('logical record exceeds continuation byte ceiling outside bounded affected-range format')
+    return AFFECTED_RANGES_FORMAT
 
 
 def _part(parent, payload, index, count):
@@ -253,12 +269,14 @@ def split_record(record: dict, *, max_record_bytes=MAX_RECORD_BYTES,
     payload = zlib.compress(data, COMPRESSION_LEVEL) if compression_allowed else data
     compressed = compression_allowed and len(payload) < len(data)
     if compressed:
-        format_name = (COMPRESSED_AFFECTED_FORMAT
-                       if format_name == AFFECTED_FORMAT else COMPRESSED_FORMAT)
+        format_name = ({AFFECTED_FORMAT: COMPRESSED_AFFECTED_FORMAT,
+                        AFFECTED_RANGES_FORMAT: COMPRESSED_AFFECTED_RANGES_FORMAT}
+                       .get(format_name, COMPRESSED_FORMAT))
     else:
         payload = data
-    max_parts = (MAX_AFFECTED_PARTS if format_name in
-                 (AFFECTED_FORMAT, COMPRESSED_AFFECTED_FORMAT) else MAX_PARTS)
+    affected_formats = (AFFECTED_FORMAT, COMPRESSED_AFFECTED_FORMAT,
+                        AFFECTED_RANGES_FORMAT, COMPRESSED_AFFECTED_RANGES_FORMAT)
+    max_parts = MAX_AFFECTED_PARTS if format_name in affected_formats else MAX_PARTS
     overhead = len(_canonical(_part(parent, b'', max_parts - 1, max_parts)))
     chunk_size = min(8192, (max_record_bytes - overhead) // 4 * 3)
     if chunk_size <= 0:
@@ -274,9 +292,10 @@ def split_record(record: dict, *, max_record_bytes=MAX_RECORD_BYTES,
              for index in range(count)]
     parent['continuation'] = {'format': format_name, 'parts': [part['record_id'] for part in parts],
         'bytes': len(data), 'sha256': _digest(data), 'requires_reassembly': True}
-    if format_name in (AFFECTED_FORMAT, COMPRESSED_AFFECTED_FORMAT):
+    if format_name in affected_formats:
         parent['continuation']['affected_count'] = len(record['affected'])
-    if format_name in (COMPRESSED_FORMAT, COMPRESSED_AFFECTED_FORMAT):
+    if format_name in (COMPRESSED_FORMAT, COMPRESSED_AFFECTED_FORMAT,
+                       COMPRESSED_AFFECTED_RANGES_FORMAT):
         parent['continuation'].update(compression='zlib', compression_level=COMPRESSION_LEVEL,
             compressed_bytes=len(payload), compressed_sha256=_digest(payload))
     result = [parent, *parts]
@@ -309,17 +328,22 @@ def join_record(parent: dict, records_by_id: Mapping[str, dict], *,
         raise ValueError('unsupported continuation descriptor')
     format_name = descriptor.get('format')
     expected_keys = {'format', 'parts', 'bytes', 'sha256', 'requires_reassembly'}
-    if format_name in (AFFECTED_FORMAT, COMPRESSED_AFFECTED_FORMAT):
+    affected_formats = (AFFECTED_FORMAT, COMPRESSED_AFFECTED_FORMAT,
+                        AFFECTED_RANGES_FORMAT, COMPRESSED_AFFECTED_RANGES_FORMAT)
+    compressed_formats = (COMPRESSED_FORMAT, COMPRESSED_AFFECTED_FORMAT,
+                          COMPRESSED_AFFECTED_RANGES_FORMAT)
+    if format_name in affected_formats:
         expected_keys.add('affected_count')
-    if format_name in (COMPRESSED_FORMAT, COMPRESSED_AFFECTED_FORMAT):
+    if format_name in compressed_formats:
         expected_keys.update(('compression', 'compression_level', 'compressed_bytes',
                               'compressed_sha256'))
     if (format_name not in (FORMAT, AFFECTED_FORMAT, COMPRESSED_FORMAT,
-                            COMPRESSED_AFFECTED_FORMAT) or set(descriptor) != expected_keys
+                            COMPRESSED_AFFECTED_FORMAT, AFFECTED_RANGES_FORMAT,
+                            COMPRESSED_AFFECTED_RANGES_FORMAT) or set(descriptor) != expected_keys
             or descriptor['requires_reassembly'] is not True):
         raise ValueError('unsupported continuation descriptor')
-    affected_format = format_name in (AFFECTED_FORMAT, COMPRESSED_AFFECTED_FORMAT)
-    compressed_format = format_name in (COMPRESSED_FORMAT, COMPRESSED_AFFECTED_FORMAT)
+    affected_format = format_name in affected_formats
+    compressed_format = format_name in compressed_formats
     if affected_format and (type(descriptor['affected_count']) is not int
                             or descriptor['affected_count'] <= 0):
         raise ValueError('invalid affected continuation item count')
@@ -401,8 +425,10 @@ def join_record(parent: dict, records_by_id: Mapping[str, dict], *,
         raise ValueError('logical continuation identity or content hash mismatch')
     logical = _expand_record(stored_logical)
     logical_format = _format(logical, len(_canonical(logical)), max_logical_bytes)
-    accepted_formats = ({FORMAT, COMPRESSED_FORMAT} if logical_format == FORMAT
-                        else {AFFECTED_FORMAT, COMPRESSED_AFFECTED_FORMAT})
+    accepted_formats = ({FORMAT, COMPRESSED_FORMAT} if logical_format == FORMAT else
+                        {AFFECTED_FORMAT, COMPRESSED_AFFECTED_FORMAT}
+                        if logical_format == AFFECTED_FORMAT else
+                        {AFFECTED_RANGES_FORMAT, COMPRESSED_AFFECTED_RANGES_FORMAT})
     if format_name not in accepted_formats:
         raise ValueError('continuation format does not match bounded logical structure')
     if affected_format and len(logical['affected']) != descriptor['affected_count']:
